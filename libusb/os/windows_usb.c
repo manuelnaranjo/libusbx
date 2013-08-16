@@ -812,6 +812,7 @@ LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
     char* hotplug_path;
     bool online;
     ssize_t i;
+    unsigned long session_id;
 
     if (wParam != DBT_DEVICEARRIVAL && wParam != DBT_DEVICEREMOVECOMPLETE) {
         return ret;
@@ -844,6 +845,8 @@ LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
         usbi_err(ctx, "could not sanitize", dev_bdi->dbcc_name);
         return ret;
     }
+    session_id = htab_hash(hotplug_path);
+    safe_free(hotplug_path);
 
     online = (wParam == DBT_DEVICEARRIVAL);
     if (online) {
@@ -851,31 +854,28 @@ LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
         libusb_get_device_list(ctx, &devs);
     }
 
-    dev = usbi_get_device_by_session_id(ctx, usbi_hash(hotplug_path));
+    dev = usbi_get_device_by_session_id(ctx, session_id);
     if (dev == NULL) {
-        usbi_warn(ctx, "%s: '%s' (not active)",
+        usbi_warn(ctx, "%s %ld(not active)",
                   (online)?"INSERTION":"REMOVAL",
-                  hotplug_path);
-        safe_free(hotplug_path);
+                  session_id);
         return ret;
     }
 
-    priv = __device_priv(dev);
+    priv = _device_priv(dev);
     usbi_warn(ctx,
-              "(bus: %d, addr: %d, depth: %d, port: %d)",
+              "(bus: %d, addr: %d, depth: %d, port: %d, state: %s)",
               dev->bus_number,
               dev->device_address,
               priv->depth,
-              priv->port);
-    usbi_warn(ctx, "%s: '%s'",
-              (online)?"INSERTION":"REMOVAL",
-              hotplug_path);
-    usbi_mutex_lock(&dev->status_online_lock);
-    dev->status_online = online;
-    usbi_mutex_unlock(&dev->status_online_lock);
-    usbi_notify_device_state(dev, online);
-    // TODO: do we need unref as with Linux?
-    safe_free(hotplug_path);
+              priv->port,
+              online?"INSERTION":"REMOVAL"
+        );
+
+    if (online)
+        usbi_connect_device(dev);
+    else
+        usbi_disconnect_device(dev);
 }
 
 /*
@@ -891,14 +891,6 @@ LRESULT CALLBACK messaging_callback(HWND hWnd,
 {
     static struct libusb_context* ctx;
     LRESULT ret = TRUE;
-    DEV_BROADCAST_HDR* dev_bhd;
-    DEV_BROADCAST_DEVICEINTERFACE* dev_bdi;
-    libusb_device **devs;
-    struct libusb_device *dev;
-    struct windows_device_priv *priv;
-    char* hotplug_path;
-    bool online;
-    ssize_t i;
 
     switch (message) {
     case WM_CREATE:
@@ -907,7 +899,7 @@ LRESULT CALLBACK messaging_callback(HWND hWnd,
     case WM_DEVICECHANGE:
         ret = message_callback_handle_device_change(hWnd,
                                                     message,
-                                                    wParamm,
+                                                    wParam,
                                                     lParam,
                                                     ctx);
         break;
@@ -923,8 +915,8 @@ unsigned __stdcall windows_hotplug_threaded(void* param)
     MSG msg;
     WNDCLASSEX wc;
     DEV_BROADCAST_DEVICEINTERFACE dev_bdi;
+    HWND hMessage;
     struct libusb_context* ctx = (struct libusb_context *)param;
-    struct windows_context_priv* ctx_priv = __context_priv(ctx);
     BOOL r;
 
     memset(&wc, 0, sizeof(wc));
@@ -938,7 +930,7 @@ unsigned __stdcall windows_hotplug_threaded(void* param)
         return LIBUSB_ERROR_ACCESS;
     }
 
-    ctx_priv->hMessage = CreateWindowExA(
+    hMessage = CreateWindowExA(
         WS_EX_TOPMOST,
         "libusb_messaging_class",
         "libusb_messaging",
@@ -948,7 +940,7 @@ unsigned __stdcall windows_hotplug_threaded(void* param)
         // provide no data whatsoever about the device, the event (insertion or
         // removal), or even if the device is actually USB. Bummer!
         HWND_MESSAGE, NULL, NULL, ctx);
-    if (ctx_priv->hMessage == NULL) {
+    if (hMessage == NULL) {
         usbi_err(ctx,
                  "Unable to create progress dialog: %s", windows_error_str(0));
         return LIBUSB_ERROR_ACCESS;
@@ -959,7 +951,7 @@ unsigned __stdcall windows_hotplug_threaded(void* param)
     dev_bdi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
     dev_bdi.dbcc_classguid = GUID_DEVINTERFACE_USB_DEVICE; //GUID_DEVCLASS_WCEUSBS;
 
-    if (RegisterDeviceNotification(ctx_priv->hMessage,
+    if (RegisterDeviceNotification(hMessage,
                                    &dev_bdi,
                                    DEVICE_NOTIFY_WINDOW_HANDLE) == NULL ) {
         return LIBUSB_ERROR_ACCESS;
@@ -978,6 +970,15 @@ unsigned __stdcall windows_hotplug_threaded(void* param)
     usbi_dbg("terminating thread");
 
     return LIBUSB_SUCCESS;
+}
+
+
+static int windows_get_device_list(struct libusb_context *ctx, struct discovered_devs **_discdevs);
+
+void windows_hotplug_poll(void){
+    struct discovered_devs * devs = discovered_devs_alloc();
+    windows_get_device_list(NULL, &devs);
+    discovered_devs_free(devs);
 }
 
 /*
@@ -1114,7 +1115,7 @@ init_exit: // Holds semaphore here.
                 if (hotplug_thread) {
                     // simple cleanup process, just kill the process
                     TerminateThread(hotplug_thread, 1); // destroy it
-                    CloseHandle = NULL;
+                    CloseHandle(hotplug_thread);
                     hotplug_thread = NULL;
                 }
 		for (i = 0; i < 2; i++) {
@@ -2487,8 +2488,8 @@ const struct usbi_os_backend windows_backend = {
 	windows_init,
 	windows_exit,
 
-	windows_get_device_list,
-	NULL,				/* hotplug_poll */
+	NULL, //windows_get_device_list,
+	windows_hotplug_poll, /* hotplug_poll */
 	windows_open,
 	windows_close,
 

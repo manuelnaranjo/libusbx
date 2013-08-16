@@ -92,7 +92,7 @@ const GUID GUID_DEVINTERFACE_LIBUSB0_FILTER = { 0xF9F3FF14, 0xAE21, 0x48A0, {0x8
 #define USB_API_HID         4
 #define USB_API_MAX         5
 // The following is used to indicate if the HID or composite extra props have already been set.
-#define USB_API_SET         (1<<USB_API_MAX) 
+#define USB_API_SET         (1<<USB_API_MAX)
 
 // Sub-APIs for WinUSB-like driver APIs (WinUSB, libusbK, libusb-win32 through the libusbK DLL)
 // Must have the same values as the KUSB_DRVID enum from libusbk.h
@@ -202,14 +202,6 @@ struct hid_device_priv {
 	WCHAR string[3][MAX_USB_STRING_LENGTH];
 	uint8_t string_index[3];	// man, prod, ser
 };
-
-struct windows_context_priv {
-	HWND hMessage;
-};
-
-static inline struct windows_context_priv *__context_priv(struct libusb_context *ctx) {
-	return (struct windows_context_priv *)ctx->os_priv;
-}
 
 typedef struct libusb_device_descriptor USB_DEVICE_DESCRIPTOR, *PUSB_DEVICE_DESCRIPTOR;
 struct windows_device_priv {
@@ -786,7 +778,7 @@ typedef enum _KUSB_FNID
 	KUSB_FNID_GetOverlappedResult,
 	KUSB_FNID_GetProperty,
 	KUSB_FNID_COUNT,
-} KUSB_FNID; 
+} KUSB_FNID;
 
 typedef struct _KLIB_VERSION {
 	INT Major;
