@@ -33,6 +33,7 @@
 #include <inttypes.h>
 #include <objbase.h>
 #include <winioctl.h>
+#include <dbt.h>
 
 #include "libusbi.h"
 #include "poll_windows.h"
@@ -112,6 +113,8 @@ struct timespec timer_tp;
 volatile LONG request_count[2] = {0, 1};	// last one must be > 0
 HANDLE timer_request[2] = { NULL, NULL };
 HANDLE timer_response = NULL;
+// Hotplub thread
+HANDLE hotplug_thread = NULL;
 // API globals
 #define CHECK_WINUSBX_AVAILABLE(sub_api) do { if (sub_api == SUB_API_NOTSET) sub_api = priv->sub_api; \
 	if (!WinUSBX[sub_api].initialized) return LIBUSB_ERROR_ACCESS; } while(0)
@@ -304,6 +307,10 @@ static SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details(struct libusb_co
 	if (_index <= 0) {
 		*dev_info = pSetupDiGetClassDevsA(guid, NULL, NULL, DIGCF_PRESENT|DIGCF_DEVICEINTERFACE);
 	}
+
+        if (dev_info == INVALID_HANDLE_VALUE) {
+            return NULL;
+        }
 
 	if (dev_info_data != NULL) {
 		dev_info_data->cbSize = sizeof(SP_DEVINFO_DATA);
@@ -790,6 +797,189 @@ static void auto_release(struct usbi_transfer *itransfer)
 	usbi_mutex_unlock(&autoclaim_lock);
 }
 
+LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
+                                                       UINT message,
+                                                       WPARAM wParam,
+                                                       LPARAM lParam,
+                                                       struct libusb_context* ctx)
+{
+    LRESULT ret = TRUE;
+    DEV_BROADCAST_HDR* dev_bhd;
+    DEV_BROADCAST_DEVICEINTERFACE* dev_bdi;
+    libusb_device **devs;
+    struct libusb_device *dev;
+    struct windows_device_priv *priv;
+    char* hotplug_path;
+    bool online;
+    ssize_t i;
+
+    if (wParam != DBT_DEVICEARRIVAL && wParam != DBT_DEVICEREMOVECOMPLETE) {
+        return ret;
+    }
+
+    dev_bhd = (DEV_BROADCAST_HDR*)lParam;
+    if (dev_bhd->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE ) {
+        return ret;
+    }
+
+    dev_bdi = (DEV_BROADCAST_DEVICEINTERFACE*)dev_bhd;
+    // We assert that a device interface path is just a device id plus a GUID
+    for (i = safe_strlen(dev_bdi->dbcc_name)-38; i >= 0; ) {
+        // GUID is 38 chars
+        if (dev_bdi->dbcc_name[i--] == '{' && dev_bdi->dbcc_name[i--] == '#')
+            {
+                dev_bdi->dbcc_name[++i] = 0;
+                break;
+            }
+    }
+
+    if (i < 0) {
+        usbi_err(ctx, "%s is not a device interface path",
+                 dev_bdi->dbcc_name);
+        return ret;
+    }
+
+    hotplug_path = sanitize_path(dev_bdi->dbcc_name);
+    if (hotplug_path == NULL) {
+        usbi_err(ctx, "could not sanitize", dev_bdi->dbcc_name);
+        return ret;
+    }
+
+    online = (wParam == DBT_DEVICEARRIVAL);
+    if (online) {
+        // If it's an insertion, update the list
+        libusb_get_device_list(ctx, &devs);
+    }
+
+    dev = usbi_get_device_by_session_id(ctx, usbi_hash(hotplug_path));
+    if (dev == NULL) {
+        usbi_warn(ctx, "%s: '%s' (not active)",
+                  (online)?"INSERTION":"REMOVAL",
+                  hotplug_path);
+        safe_free(hotplug_path);
+        return ret;
+    }
+
+    priv = __device_priv(dev);
+    usbi_warn(ctx,
+              "(bus: %d, addr: %d, depth: %d, port: %d)",
+              dev->bus_number,
+              dev->device_address,
+              priv->depth,
+              priv->port);
+    usbi_warn(ctx, "%s: '%s'",
+              (online)?"INSERTION":"REMOVAL",
+              hotplug_path);
+    usbi_mutex_lock(&dev->status_online_lock);
+    dev->status_online = online;
+    usbi_mutex_unlock(&dev->status_online_lock);
+    usbi_notify_device_state(dev, online);
+    // TODO: do we need unref as with Linux?
+    safe_free(hotplug_path);
+}
+
+/*
+ * Hotplug messaging callback
+ */
+// TODO: Windows limitations mean we cannot detect driverless devices with this
+//       => add another more generic callback for driverless, and check against
+//          this one?
+LRESULT CALLBACK messaging_callback(HWND hWnd,
+                                    UINT message,
+                                    WPARAM wParam,
+                                    LPARAM lParam)
+{
+    static struct libusb_context* ctx;
+    LRESULT ret = TRUE;
+    DEV_BROADCAST_HDR* dev_bhd;
+    DEV_BROADCAST_DEVICEINTERFACE* dev_bdi;
+    libusb_device **devs;
+    struct libusb_device *dev;
+    struct windows_device_priv *priv;
+    char* hotplug_path;
+    bool online;
+    ssize_t i;
+
+    switch (message) {
+    case WM_CREATE:
+        ctx = (libusb_context*)((CREATESTRUCT*)lParam)->lpCreateParams;
+        break;
+    case WM_DEVICECHANGE:
+        ret = message_callback_handle_device_change(hWnd,
+                                                    message,
+                                                    wParamm,
+                                                    lParam,
+                                                    ctx);
+        break;
+    default:
+        ret = DefWindowProc(hWnd, message, wParam, lParam);
+        break;
+    }
+    return ret;
+}
+
+unsigned __stdcall windows_hotplug_threaded(void* param)
+{
+    MSG msg;
+    WNDCLASSEX wc;
+    DEV_BROADCAST_DEVICEINTERFACE dev_bdi;
+    struct libusb_context* ctx = (struct libusb_context *)param;
+    struct windows_context_priv* ctx_priv = __context_priv(ctx);
+    BOOL r;
+
+    memset(&wc, 0, sizeof(wc));
+    wc.cbSize = sizeof(WNDCLASSEX);
+    wc.style = CS_DBLCLKS | CS_SAVEBITS;
+    wc.lpfnWndProc = messaging_callback;
+    wc.lpszClassName = "libusb_messaging_class";
+
+    if (!RegisterClassExA(&wc)) {
+        usbi_err(ctx, "can't register class %s", windows_error_str(0));
+        return LIBUSB_ERROR_ACCESS;
+    }
+
+    ctx_priv->hMessage = CreateWindowExA(
+        WS_EX_TOPMOST,
+        "libusb_messaging_class",
+        "libusb_messaging",
+        0, 100, 100, 287, 102,
+        // Note: Using HWND_MESSAGE removes broadcast events, like the ones from
+        // driverless devices. However the broadcast events you get on driverless
+        // provide no data whatsoever about the device, the event (insertion or
+        // removal), or even if the device is actually USB. Bummer!
+        HWND_MESSAGE, NULL, NULL, ctx);
+    if (ctx_priv->hMessage == NULL) {
+        usbi_err(ctx,
+                 "Unable to create progress dialog: %s", windows_error_str(0));
+        return LIBUSB_ERROR_ACCESS;
+    }
+
+    memset(&dev_bdi, 0, sizeof(dev_bdi));
+    dev_bdi.dbcc_size = sizeof(DEV_BROADCAST_DEVICEINTERFACE);
+    dev_bdi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+    dev_bdi.dbcc_classguid = GUID_DEVINTERFACE_USB_DEVICE; //GUID_DEVCLASS_WCEUSBS;
+
+    if (RegisterDeviceNotification(ctx_priv->hMessage,
+                                   &dev_bdi,
+                                   DEVICE_NOTIFY_WINDOW_HANDLE) == NULL ) {
+        return LIBUSB_ERROR_ACCESS;
+    }
+
+    // We need to handle the message pump
+    while( (r = GetMessage(&msg, NULL, 0, 0)) != 0) {
+        if (r == -1) {
+            usbi_err(ctx, "GetMessage error");
+        } else {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+
+    usbi_dbg("terminating thread");
+
+    return LIBUSB_SUCCESS;
+}
+
 /*
  * init: libusbx backend init function
  *
@@ -879,12 +1069,23 @@ static int windows_init(struct libusb_context *ctx)
 			usbi_err(ctx, "could not create timer mutex - aborting");
 			goto init_exit;
 		}
+		// TODO: pass ctx to timer thread
 		timer_thread = (HANDLE)_beginthreadex(NULL, 0, windows_clock_gettime_threaded, NULL, 0, NULL);
 		if (timer_thread == NULL) {
 			usbi_err(ctx, "Unable to create timer thread - aborting");
 			goto init_exit;
 		}
 		SetThreadAffinityMask(timer_thread, 0);
+
+                hotplug_thread = (HANDLE)_beginthreadex(NULL, 0,
+                                                        windows_hotplug_threaded,
+                                                        ctx,
+                                                        0,
+                                                        NULL);
+                if (hotplug_thread == NULL){
+                    usbi_err(ctx, "Unable to create hotplug thread - aborting");
+                    goto init_exit;
+                }
 
 		// Wait for timer thread to init before continuing.
 		if (WaitForSingleObject(timer_response, INFINITE) != WAIT_OBJECT_0) {
@@ -910,6 +1111,12 @@ init_exit: // Holds semaphore here.
 			CloseHandle(timer_thread);
 			timer_thread = NULL;
 		}
+                if (hotplug_thread) {
+                    // simple cleanup process, just kill the process
+                    TerminateThread(hotplug_thread, 1); // destroy it
+                    CloseHandle = NULL;
+                    hotplug_thread = NULL;
+                }
 		for (i = 0; i < 2; i++) {
 			if (timer_request[i]) {
 				CloseHandle(timer_request[i]);
@@ -1230,7 +1437,7 @@ static void get_api_type(struct libusb_context *ctx, HDEVINFO *dev_info,
 		for (k=0; k<3; k++) {
 			j = get_sub_api(lookup[k].list, i);
 			if (j >= 0) {
-				usbi_dbg("matched %s name against %s API", 
+				usbi_dbg("matched %s name against %s API",
 					lookup[k].designation, (i!=USB_API_WINUSBX)?usb_api_backend[i].designation:sub_api_name[j]);
 				*api = i;
 				*sub_api = j;
@@ -2315,6 +2522,7 @@ const struct usbi_os_backend windows_backend = {
 #if defined(USBI_TIMERFD_AVAILABLE)
 	NULL,
 #endif
+	sizeof(struct windows_context_priv),
 	sizeof(struct windows_device_priv),
 	sizeof(struct windows_device_handle_priv),
 	sizeof(struct windows_transfer_priv),
@@ -4371,7 +4579,7 @@ static int composite_reset_device(int sub_api, struct libusb_device_handle *dev_
 {
 	struct windows_device_priv *priv = _device_priv(dev_handle->dev);
 	int r;
-	uint8_t i; 
+	uint8_t i;
 	bool available[SUB_API_MAX];
 	for (i = 0; i<SUB_API_MAX; i++) {
 		available[i] = false;

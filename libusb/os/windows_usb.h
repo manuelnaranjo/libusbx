@@ -203,6 +203,14 @@ struct hid_device_priv {
 	uint8_t string_index[3];	// man, prod, ser
 };
 
+struct windows_context_priv {
+	HWND hMessage;
+};
+
+static inline struct windows_context_priv *__context_priv(struct libusb_context *ctx) {
+	return (struct windows_context_priv *)ctx->os_priv;
+}
+
 typedef struct libusb_device_descriptor USB_DEVICE_DESCRIPTOR, *PUSB_DEVICE_DESCRIPTOR;
 struct windows_device_priv {
 	uint8_t depth;						// distance to HCD
