@@ -655,10 +655,10 @@ ssize_t usbi_write(int fd, const void *buf, size_t count)
 
 	CHECK_INIT_POLLING;
 
-	if (count != sizeof(unsigned char)) {
-		usbi_err(NULL, "this function should only used for signaling");
-		return -1;
-	}
+	//if (count != sizeof(unsigned char)) {
+	//	usbi_err(NULL, "this function should only used for signaling");
+	//	return -1;
+	//}
 
 	_index = _fd_to_index_and_lock(fd);
 
@@ -692,10 +692,10 @@ ssize_t usbi_read(int fd, void *buf, size_t count)
 
 	CHECK_INIT_POLLING;
 
-	if (count != sizeof(unsigned char)) {
-		usbi_err(NULL, "this function should only used for signaling");
-		return -1;
-	}
+	//if (count != sizeof(unsigned char)) {
+	//	usbi_err(NULL, "this function should only used for signaling");
+	//	return -1;
+	//}
 
 	_index = _fd_to_index_and_lock(fd);
 

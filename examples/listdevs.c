@@ -25,7 +25,7 @@ static void print_devs(libusb_device **devs)
 {
 	libusb_device *dev;
 	int i = 0, j = 0;
-	uint8_t path[8]; 
+	uint8_t path[8];
 
 	while ((dev = devs[i++]) != NULL) {
 		struct libusb_device_descriptor desc;
@@ -58,6 +58,9 @@ int main(void)
 	r = libusb_init(NULL);
 	if (r < 0)
 		return r;
+
+        libusb_set_debug(NULL, 4);
+
 
 	cnt = libusb_get_device_list(NULL, &devs);
 	if (cnt < 0)

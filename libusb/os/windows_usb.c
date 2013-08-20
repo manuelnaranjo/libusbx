@@ -853,11 +853,10 @@ LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
     // We assert that a device interface path is just a device id plus a GUID
     for (i = safe_strlen(dev_bdi->dbcc_name)-38; i >= 0; ) {
         // GUID is 38 chars
-        if (dev_bdi->dbcc_name[i--] == '{' && dev_bdi->dbcc_name[i--] == '#')
-            {
-                dev_bdi->dbcc_name[++i] = 0;
-                break;
-            }
+        if (dev_bdi->dbcc_name[i--] == '{' && dev_bdi->dbcc_name[i--] == '#'){
+            dev_bdi->dbcc_name[++i] = 0;
+            break;
+        }
     }
 
     if (i < 0) {
@@ -872,23 +871,33 @@ LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
         return ret;
     }
     session_id = htab_hash(hotplug_path);
-    safe_free(hotplug_path);
 
     online = (wParam == DBT_DEVICEARRIVAL);
 
     usbi_mutex_static_lock(&active_contexts_lock);
     list_for_each_entry( ctx, &active_contexts_list, list, struct libusb_context){
-        if (online) {
+        //if (online) {
             // If it's an insertion, update the list
-            libusb_get_device_list(ctx, &devs);
-        }
-
+        //    libusb_get_device_list(ctx, &devs);
+        //}
+        usbi_dbg("allocating new device for session [%X] with path %s",
+                 session_id,
+                 hotplug_path);
         dev = usbi_get_device_by_session_id(ctx, session_id);
         if (dev == NULL) {
-            usbi_warn(ctx, "%s %ld(not active)",
-                      online?"INSERTION":"REMOVAL",
-                      session_id);
-            continue;
+            dev = usbi_alloc_device(ctx, session_id);
+            if (dev == NULL){
+                usbi_warn(ctx, "%s %ld(not active)",
+                          online?"INSERTION":"REMOVAL",
+                          session_id);
+                continue;
+            }
+            windows_device_priv_init(dev);
+            init_device(dev,          // device
+                        NULL,         // parent
+                        -1,           // port number
+                        hotplug_path, // path
+                        0);           // DevInst
         }
 
         priv = _device_priv(dev);
@@ -907,6 +916,9 @@ LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
             usbi_disconnect_device(dev);
     }
     usbi_mutex_static_unlock(&active_contexts_lock);
+
+    safe_free(hotplug_path);
+    return ret;
 }
 
 /*
@@ -977,11 +989,14 @@ unsigned __stdcall windows_hotplug_threaded(void* param)
     dev_bdi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
     dev_bdi.dbcc_classguid = GUID_DEVINTERFACE_USB_DEVICE; //GUID_DEVCLASS_WCEUSBS;
 
+
     if (RegisterDeviceNotification(hMessage,
                                    &dev_bdi,
                                    DEVICE_NOTIFY_WINDOW_HANDLE) == NULL ) {
         return LIBUSB_ERROR_ACCESS;
     }
+
+    usbi_info(ctx, "hotplug waiting for messages");
 
     // We need to handle the message pump
     while( (r = GetMessage(&msg, NULL, 0, 0)) != 0) {
@@ -1423,17 +1438,23 @@ static int windows_init(struct libusb_context *ctx)
 	HANDLE semaphore;
 	char sem_name[11+1+8]; // strlen(libusb_init)+'\0'+(32-bit hex PID)
 
-	sprintf(sem_name, "libusb_init%08X", (unsigned int)GetCurrentProcessId()&0xFFFFFFFF);
+	sprintf(sem_name,
+                "libusb_init%08X",
+                (unsigned int)GetCurrentProcessId()&0xFFFFFFFF);
 	semaphore = CreateSemaphoreA(NULL, 1, 1, sem_name);
 	if (semaphore == NULL) {
-		usbi_err(ctx, "could not create semaphore: %s", windows_error_str(0));
+		usbi_err(ctx,
+                         "could not create semaphore: %s",
+                         windows_error_str(0));
 		return LIBUSB_ERROR_NO_MEM;
 	}
 
 	// A successful wait brings our semaphore count to 0 (unsignaled)
 	// => any concurent wait stalls until the semaphore's release
 	if (WaitForSingleObject(semaphore, INFINITE) != WAIT_OBJECT_0) {
-		usbi_err(ctx, "failure to access semaphore: %s", windows_error_str(0));
+		usbi_err(ctx,
+                         "failure to access semaphore: %s",
+                         windows_error_str(0));
 		CloseHandle(semaphore);
 		return LIBUSB_ERROR_NO_MEM;
 	}
@@ -1715,112 +1736,157 @@ static int init_device(struct libusb_device* dev,
                        char* device_id,
                        DWORD devinst)
 {
-	HANDLE handle;
-	DWORD size;
-	USB_NODE_CONNECTION_INFORMATION_EX conn_info;
-	struct windows_device_priv *priv, *parent_priv;
-	struct libusb_context *ctx = DEVICE_CTX(dev);
-	struct libusb_device* tmp_dev;
-	unsigned i;
+    HANDLE handle;
+    DWORD size;
+    USB_NODE_CONNECTION_INFORMATION_EX conn_info;
+    struct windows_device_priv *priv, *parent_priv;
+    struct libusb_context *ctx = DEVICE_CTX(dev);
+    struct libusb_device* tmp_dev;
+    int res;
+    unsigned i;
+    unsigned long tmp_sess_id;
 
-	if ((dev == NULL) || (parent_dev == NULL)) {
-		return LIBUSB_ERROR_NOT_FOUND;
-	}
-	priv = _device_priv(dev);
-	parent_priv = _device_priv(parent_dev);
-	if (parent_priv->apib->id != USB_API_HUB) {
-		usbi_warn(ctx, "parent for device '%s' is not a hub", device_id);
-		return LIBUSB_ERROR_NOT_FOUND;
-	}
+    if ((dev == NULL) || (parent_dev == NULL)) {
+        return LIBUSB_ERROR_NOT_FOUND;
+    }
 
-	// It is possible for the parent hub not to have been initialized yet
-	// If that's the case, lookup the ancestors to set the bus number
-	if (parent_dev->bus_number == 0) {
-		for (i=2; ; i++) {
-			tmp_dev = usbi_get_device_by_session_id(ctx, get_ancestor_session_id(devinst, i));
-			if (tmp_dev == NULL) break;
-			if (tmp_dev->bus_number != 0) {
-				usbi_dbg("got bus number from ancestor #%d", i);
-				parent_dev->bus_number = tmp_dev->bus_number;
-				break;
-			}
-		}
-	}
-	if (parent_dev->bus_number == 0) {
-		usbi_err(ctx, "program assertion failed: unable to find ancestor bus number for '%s'", device_id);
-		return LIBUSB_ERROR_NOT_FOUND;
-	}
-	dev->bus_number = parent_dev->bus_number;
-	priv->port = port_number;
-	dev->port_number = port_number;
-	priv->depth = parent_priv->depth + 1;
-	priv->parent_dev = parent_dev;
-	dev->parent_dev = libusb_ref_device(parent_dev);
+    priv = _device_priv(dev);
+    parent_priv = _device_priv(parent_dev);
+    if (parent_priv->apib->id != USB_API_HUB) {
+        usbi_warn(ctx, "parent for device '%s' is not a hub", device_id);
+        return LIBUSB_ERROR_NOT_FOUND;
+    }
 
-	// If the device address is already set, we can stop here
-	if (dev->device_address != 0) {
-		return LIBUSB_SUCCESS;
-	}
-	memset(&conn_info, 0, sizeof(conn_info));
-	if (priv->depth != 0) {	// Not a HCD hub
-		handle = CreateFileA(parent_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-			FILE_FLAG_OVERLAPPED, NULL);
-		if (handle == INVALID_HANDLE_VALUE) {
-			usbi_warn(ctx, "could not open hub %s: %s", parent_priv->path, windows_error_str(0));
-			return LIBUSB_ERROR_ACCESS;
-		}
-		size = sizeof(conn_info);
-		conn_info.ConnectionIndex = (ULONG)port_number;
-		if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info, size,
-			&conn_info, size, &size, NULL)) {
-			usbi_warn(ctx, "could not get node connection information for device '%s': %s",
-				device_id, windows_error_str(0));
-			safe_closehandle(handle);
-			return LIBUSB_ERROR_NO_DEVICE;
-		}
-		if (conn_info.ConnectionStatus == NoDeviceConnected) {
-			usbi_err(ctx, "device '%s' is no longer connected!", device_id);
-			safe_closehandle(handle);
-			return LIBUSB_ERROR_NO_DEVICE;
-		}
-		memcpy(&priv->dev_descriptor, &(conn_info.DeviceDescriptor), sizeof(USB_DEVICE_DESCRIPTOR));
-		dev->num_configurations = priv->dev_descriptor.bNumConfigurations;
-		priv->active_config = conn_info.CurrentConfigurationValue;
-		usbi_dbg("found %d configurations (active conf: %d)", dev->num_configurations, priv->active_config);
-		// If we can't read the config descriptors, just set the number of confs to zero
-		if (cache_config_descriptors(dev, handle, device_id) != LIBUSB_SUCCESS) {
-			dev->num_configurations = 0;
-			priv->dev_descriptor.bNumConfigurations = 0;
-		}
-		safe_closehandle(handle);
+    // It is possible for the parent hub not to have been initialized yet
+    // If that's the case, lookup the ancestors to set the bus number
+    if (parent_dev->bus_number == 0) {
+        for (i=2; ; i++) {
+            tmp_sess_id = get_ancestor_session_id(devinst, i);
+            tmp_dev = usbi_get_device_by_session_id(ctx, tmp_sess_id);
+            if (tmp_dev == NULL) break;
+            if (tmp_dev->bus_number != 0) {
+                usbi_dbg("got bus number from ancestor #%d", i);
+                parent_dev->bus_number = tmp_dev->bus_number;
+                break;
+            }
+        }
+    }
 
-		if (conn_info.DeviceAddress > UINT8_MAX) {
-			usbi_err(ctx, "program assertion failed: device address overflow");
-		}
-		dev->device_address = (uint8_t)conn_info.DeviceAddress + 1;
-		if (dev->device_address == 1) {
-			usbi_err(ctx, "program assertion failed: device address collision with root hub");
-		}
-		switch (conn_info.Speed) {
-		case 0: dev->speed = LIBUSB_SPEED_LOW; break;
-		case 1: dev->speed = LIBUSB_SPEED_FULL; break;
-		case 2: dev->speed = LIBUSB_SPEED_HIGH; break;
-		case 3: dev->speed = LIBUSB_SPEED_SUPER; break;
-		default:
-			usbi_warn(ctx, "Got unknown device speed %d", conn_info.Speed);
-			break;
-		}
-	} else {
-		dev->device_address = 1;	// root hubs are set to use device number 1
-		force_hcd_device_descriptor(dev);
-	}
+    if (parent_dev->bus_number == 0) {
+        usbi_err(ctx,
+                 "program assertion failed: unable to find ancestor"
+                 " bus number for '%s'", device_id);
+        return LIBUSB_ERROR_NOT_FOUND;
+    }
 
-	usbi_sanitize_device(dev);
+    dev->bus_number = parent_dev->bus_number;
+    priv->port = port_number;
+    dev->port_number = port_number;
+    priv->depth = parent_priv->depth + 1;
+    priv->parent_dev = parent_dev;
+    dev->parent_dev = libusb_ref_device(parent_dev);
 
-	usbi_dbg("(bus: %d, addr: %d, depth: %d, port: %d): '%s'",
-		dev->bus_number, dev->device_address, priv->depth, priv->port, device_id);
+    // If the device address is already set, we can stop here
+    if (dev->device_address != 0) {
+        return LIBUSB_SUCCESS;
+    }
+    memset(&conn_info, 0, sizeof(conn_info));
+    if (priv->depth != 0) {	// Not a HCD hub
+        handle = CreateFileA(parent_priv->path,
+                             GENERIC_WRITE,
+                             FILE_SHARE_WRITE,
+                             NULL,
+                             OPEN_EXISTING,
+                             FILE_FLAG_OVERLAPPED,
+                             NULL);
+        if (handle == INVALID_HANDLE_VALUE) {
+            usbi_warn(ctx,
+                      "could not open hub %s: %s",
+                      parent_priv->path,
+                      windows_error_str(0));
+            return LIBUSB_ERROR_ACCESS;
+        }
+        size = sizeof(conn_info);
+        conn_info.ConnectionIndex = (ULONG)port_number;
+        if (!DeviceIoControl(handle,
+                             IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX,
+                             &conn_info,
+                             size,
+                             &conn_info,
+                             size,
+                             &size,
+                             NULL))
+            {
+                usbi_warn(ctx,
+                          "could not get node connection information for"
+                          " device '%s': %s",
+                          device_id,
+                          windows_error_str(0));
+                safe_closehandle(handle);
+                return LIBUSB_ERROR_NO_DEVICE;
+            }
+        if (conn_info.ConnectionStatus == NoDeviceConnected) {
+            usbi_err(ctx,
+                     "device '%s' is no longer connected!",
+                     device_id);
+            safe_closehandle(handle);
+            return LIBUSB_ERROR_NO_DEVICE;
+        }
+        memcpy(&priv->dev_descriptor,
+               &(conn_info.DeviceDescriptor),
+               sizeof(USB_DEVICE_DESCRIPTOR));
+        dev->num_configurations = priv->dev_descriptor.bNumConfigurations;
+        priv->active_config = conn_info.CurrentConfigurationValue;
+        usbi_dbg("found %d configurations (active conf: %d)",
+                 dev->num_configurations,
+                 priv->active_config);
+        // If we can't read the config descriptors, just set the number
+        // of confs to zero
+        res = cache_config_descriptors(dev, handle, device_id);
+        if ( res != LIBUSB_SUCCESS) {
+            dev->num_configurations = 0;
+            priv->dev_descriptor.bNumConfigurations = 0;
+        }
+        safe_closehandle(handle);
 
-	return LIBUSB_SUCCESS;
+        if (conn_info.DeviceAddress > UINT8_MAX) {
+            usbi_err(ctx,
+                     "program assertion failed: device address"
+                     " overflow");
+        }
+        dev->device_address = (uint8_t)conn_info.DeviceAddress + 1;
+        if (dev->device_address == 1) {
+            usbi_err(ctx,
+                     "program assertion failed: device address "
+                     "collision with root hub");
+        }
+        switch (conn_info.Speed) {
+        case 0: dev->speed = LIBUSB_SPEED_LOW; break;
+        case 1: dev->speed = LIBUSB_SPEED_FULL; break;
+        case 2: dev->speed = LIBUSB_SPEED_HIGH; break;
+        case 3: dev->speed = LIBUSB_SPEED_SUPER; break;
+        default:
+            usbi_warn(ctx,
+                      "Got unknown device speed %d",
+                      conn_info.Speed);
+            break;
+        }
+    } else {
+        // root hubs are set to use device number 1
+        dev->device_address = 1;
+        force_hcd_device_descriptor(dev);
+    }
+
+    usbi_sanitize_device(dev);
+
+    usbi_dbg("(bus: %d, addr: %d, depth: %d, port: %d): '%s'",
+             dev->bus_number,
+             dev->device_address,
+             priv->depth,
+             priv->port,
+             device_id);
+
+    return LIBUSB_SUCCESS;
 }
 
 // Returns the api type, or 0 if not found/unsupported

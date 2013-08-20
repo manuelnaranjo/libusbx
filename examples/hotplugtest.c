@@ -66,6 +66,7 @@ int main(int argc, char *argv[])
 	class_id   = (argc > 3) ? strtol (argv[3], NULL, 0) : LIBUSB_HOTPLUG_MATCH_ANY;
 
 	libusb_init (NULL);
+	libusb_set_debug(NULL, 4);
 
 	if (!libusb_has_capability (LIBUSB_CAP_HAS_HOTPLUG)) {
 		printf ("Hotplug capabilites are not supported on this platform\n");
@@ -73,7 +74,10 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	rc = libusb_hotplug_register_callback (NULL, LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED, 0, vendor_id,
+	rc = libusb_hotplug_register_callback(NULL,
+					      LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED,
+					      0,
+					      vendor_id,
 		product_id, class_id, hotplug_callback, NULL, &hp[0]);
 	if (LIBUSB_SUCCESS != rc) {
 		fprintf (stderr, "Error registering callback 0\n");
@@ -81,14 +85,22 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	rc = libusb_hotplug_register_callback (NULL, LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT, 0, vendor_id,
-		product_id,class_id, hotplug_callback_detach, NULL, &hp[1]);
+	rc = libusb_hotplug_register_callback (NULL,
+					       LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT,
+					       0,
+					       vendor_id,
+					       product_id,
+					       class_id,
+					       hotplug_callback_detach,
+					       NULL,
+					       &hp[1]);
 	if (LIBUSB_SUCCESS != rc) {
 		fprintf (stderr, "Error registering callback 1\n");
 		libusb_exit (NULL);
 		return EXIT_FAILURE;
 	}
 
+	fprintf(stdout, "Waiting for events\n");
 	while (done < 2) {
 		libusb_handle_events (NULL);
 	}
