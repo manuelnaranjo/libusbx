@@ -44,11 +44,37 @@
 #define LOOP_BREAK(err) { r=err; continue; }
 
 // Helper prototypes
-static int windows_get_active_config_descriptor(struct libusb_device *dev, unsigned char *buffer, size_t len, int *host_endian);
-static int windows_clock_gettime(int clk_id, struct timespec *tp);
+static int windows_get_active_config_descriptor(struct libusb_device *dev,
+                                                unsigned char *buffer,
+                                                size_t len,
+                                                int *host_endian);
+static int windows_clock_gettime(int clk_id,
+                                 struct timespec *tp);
 unsigned __stdcall windows_clock_gettime_threaded(void* param);
 // Common calls
-static int common_configure_endpoints(int sub_api, struct libusb_device_handle *dev_handle, int iface);
+static int common_configure_endpoints(int sub_api,
+                                      struct libusb_device_handle *dev_handle,
+                                      int iface);
+static void get_api_type(struct libusb_context *ctx,
+                         HDEVINFO *dev_info,
+                         SP_DEVINFO_DATA *dev_info_data,
+                         int *api,
+                         int *sub_api);
+static int set_composite_interface(struct libusb_context* ctx,
+                                   struct libusb_device* dev,
+                                   char* dev_interface_path,
+                                   char* device_id,
+                                   int api,
+                                   int sub_api);
+static int set_hid_interface(struct libusb_context* ctx,
+                             struct libusb_device* dev,
+                             char* dev_interface_path);
+static int init_device(struct libusb_device* dev,
+                       struct libusb_device* parent_dev,
+                       uint8_t port_number,
+                       char* device_id,
+                       DWORD devinst);
+
 
 // WinUSB-like API prototypes
 static int winusbx_init(int sub_api, struct libusb_context *ctx);
@@ -999,8 +1025,8 @@ void windows_hotplug_poll_internal(struct libusb_context *ctx){
     LONG s;
 
     // Keep a list of newly allocated devs to unref
-    list_init(&disc_devs);
-    list_init(&unref_devs);
+    //list_init(&disc_devs);
+    //list_init(&unref_devs);
 
     // PASS 1 : (re)enumerate HCDs (allows for HCD hotplug)
     // PASS 2 : (re)enumerate HUBS
@@ -1326,12 +1352,8 @@ void windows_hotplug_poll_internal(struct libusb_context *ctx){
                                 dev_id_path,
                                 dev_info_data.DevInst);
                 if (r == LIBUSB_SUCCESS) {
-                    // Append device to the list of discovered devices
-                    discdevs = discovered_devs_append(*_discdevs, dev);
-                    if (!discdevs) {
-                        LOOP_BREAK(LIBUSB_ERROR_NO_MEM);
-                    }
-                    *_discdevs = discdevs;
+                    // Tell lib we have a new device
+                    usbi_connect_device(dev);
                 } else if (r == LIBUSB_ERROR_NO_DEVICE) {
                     // This can occur if the device was disconnected but Windows
                     // hasn't refreshed its enumeration yet - in that case, we
@@ -1375,8 +1397,6 @@ void windows_hotplug_poll_internal(struct libusb_context *ctx){
     for (pass = HID_PASS+1; pass < nb_guids; pass++) {
         safe_free(guid[pass]);
     }
-
-    return r;
 }
 
 void windows_hotplug_poll(void){
@@ -2928,7 +2948,6 @@ const struct usbi_os_backend windows_backend = {
 #if defined(USBI_TIMERFD_AVAILABLE)
 	NULL,
 #endif
-	sizeof(struct windows_context_priv),
 	sizeof(struct windows_device_priv),
 	sizeof(struct windows_device_handle_priv),
 	sizeof(struct windows_transfer_priv),
