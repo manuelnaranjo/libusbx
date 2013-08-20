@@ -47,7 +47,7 @@
 #include "libusbi.h"
 
 // Uncomment to debug the polling layer
-//#define DEBUG_POLL_WINDOWS
+#define DEBUG_POLL_WINDOWS
 #if defined(DEBUG_POLL_WINDOWS)
 #define poll_dbg usbi_dbg
 #else
@@ -678,7 +678,7 @@ ssize_t usbi_write(int fd, const void *buf, size_t count)
 	poll_fd[_index].overlapped->InternalHigh++;
 
 	LeaveCriticalSection(&_poll_fd[_index].mutex);
-	return sizeof(unsigned char);
+	return count;
 }
 
 /*
@@ -686,41 +686,45 @@ ssize_t usbi_write(int fd, const void *buf, size_t count)
  */
 ssize_t usbi_read(int fd, void *buf, size_t count)
 {
-	int _index;
-	ssize_t r = -1;
-	UNUSED(buf);
+    int _index;
+    int res;
+    ssize_t r = -1;
+    UNUSED(buf);
 
-	CHECK_INIT_POLLING;
+    CHECK_INIT_POLLING;
 
-	//if (count != sizeof(unsigned char)) {
-	//	usbi_err(NULL, "this function should only used for signaling");
-	//	return -1;
-	//}
+    //if (count != sizeof(unsigned char)) {
+    //	usbi_err(NULL, "this function should only used for signaling");
+    //	return -1;
+    //}
 
-	_index = _fd_to_index_and_lock(fd);
+    _index = _fd_to_index_and_lock(fd);
 
-	if (_index < 0) {
-		errno = EBADF;
-		return -1;
-	}
+    if (_index < 0) {
+        errno = EBADF;
+        return -1;
+    }
 
-	if (WaitForSingleObject(poll_fd[_index].overlapped->hEvent, INFINITE) != WAIT_OBJECT_0) {
-		usbi_warn(NULL, "waiting for event failed: %d", (int)GetLastError());
-		errno = EIO;
-		goto out;
-	}
+    res = WaitForSingleObject(poll_fd[_index].overlapped->hEvent, INFINITE);
+    if (res != WAIT_OBJECT_0) {
+        usbi_warn(NULL, "waiting for event failed: %d", (int)GetLastError());
+        errno = EIO;
+        goto out;
+    }
 
-	poll_dbg("clr pipe event (fd = %d, thread = %08X)", _index, GetCurrentThreadId());
-	poll_fd[_index].overlapped->InternalHigh--;
-	// Don't reset unless we don't have any more events to process
-	if (poll_fd[_index].overlapped->InternalHigh <= 0) {
-		ResetEvent(poll_fd[_index].overlapped->hEvent);
-		poll_fd[_index].overlapped->Internal = STATUS_PENDING;
-	}
+    poll_dbg("clr pipe event (fd = %d, thread = %08X)",
+             _index,
+             GetCurrentThreadId());
+    poll_fd[_index].overlapped->InternalHigh--;
+    // Don't reset unless we don't have any more events to process
+    if (poll_fd[_index].overlapped->InternalHigh <= 0) {
+        ResetEvent(poll_fd[_index].overlapped->hEvent);
+        poll_fd[_index].overlapped->Internal = STATUS_PENDING;
+    }
 
-	r = sizeof(unsigned char);
+    r = count;
 
 out:
-	LeaveCriticalSection(&_poll_fd[_index].mutex);
-	return r;
+    LeaveCriticalSection(&_poll_fd[_index].mutex);
+    return r;
 }
