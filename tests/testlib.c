@@ -19,6 +19,10 @@
 
 #include "libusbx_testlib.h"
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -33,7 +37,7 @@
 // No support for selective redirection of STDOUT on WinCE.
 #define DISABLE_STDOUT_REDIRECTION
 #define STDOUT_FILENO 1
-#elif defined(_WIN32)
+#elif defined(_WIN32) && !(HAVE_UNISTD_H)
 #include <io.h>
 #define dup _dup
 #define dup2 _dup2
@@ -221,7 +225,7 @@ int libusbx_testlib_run_tests(int argc,
 	/* Setup test log output */
 	r = setup_test_output(&ctx);
 	if (r != 0)
-		return r;  
+		return r;
 
 	/* Act on any options not related to running tests */
 	if (ctx.list_tests) {
