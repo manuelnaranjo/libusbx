@@ -700,22 +700,17 @@ ssize_t usbi_write(int fd, const void *buf, size_t count)
 		return -1;
 	}
 
-	usbi_dbg("Adding %i bytes, list_empty %i",
-			 count,
-			 list_empty(&_poll_fd[_index].list));
 	item = calloc(1, sizeof(*item));
 	item->data = calloc(sizeof(unsigned char), count+1);
 	item->count = count;
 	for(i = 0; i < count ; i++ ){
 		item->data[i] = cbuf[i];
-		poll_dbg("%i -> 0x%02X", i, cbuf[i]);
 	}
 	list_add(&item->list, &_poll_fd[_index].list);
 
-	poll_dbg("set pipe event (fd = %d, thread = %08X, item = %p)",
+	poll_dbg("set pipe event (fd = %d, thread = %08X)",
 			 _index,
-			 GetCurrentThreadId(),
-			 item);
+			 GetCurrentThreadId());
 	SetEvent(poll_fd[_index].overlapped->hEvent);
 	poll_fd[_index].overlapped->Internal = STATUS_WAIT_0;
 	// If two threads write on the pipe at the same time, we need to
@@ -765,10 +760,9 @@ ssize_t usbi_read(int fd, void *buf, size_t count)
 	}
 
 
-	poll_dbg("clr pipe event (fd = %d, thread = %08X, expected = %i)",
+	poll_dbg("clr pipe event (fd = %d, thread = %08X)",
 			 _index,
-			 GetCurrentThreadId(),
-			 count
+			 GetCurrentThreadId()
 		);
 
 
@@ -778,14 +772,12 @@ ssize_t usbi_read(int fd, void *buf, size_t count)
 	} else {
 		int i;
 		ssize_t t;
-		unsigned char* cbuf = (unsigned char*) &buf;
+		unsigned char* cbuf = (unsigned char*) buf;
 		pdata = list_entry(_poll_fd[_index].list.next, struct pipe_data, list);
 		t = MIN(pdata->count, count);
-		poll_dbg("(item = %p, count = %i", pdata, pdata->count);
 
 		for(i = 0; i < t ; i++ ) {
 			cbuf[i] = pdata->data[i];
-			poll_dbg("0x%02X -> %i, 0x%02X", pdata->data[i], i, cbuf[i]);
 		}
 		free(pdata->data);
 		list_del(&(pdata->list));
