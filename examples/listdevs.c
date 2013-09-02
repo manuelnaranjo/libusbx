@@ -56,6 +56,7 @@ int main(void)
 	ssize_t cnt;
 
 	r = libusb_init(NULL);
+        printf("libusb init %i\n", r);
 	if (r < 0)
 		return r;
 
@@ -63,9 +64,10 @@ int main(void)
 
 
 	cnt = libusb_get_device_list(NULL, &devs);
-	if (cnt < 0)
-		return (int) cnt;
-
+	printf("Device count %i\n", cnt);
+        if (cnt < 0) {
+            return (int) cnt;
+        }
 	print_devs(devs);
 	libusb_free_device_list(devs, 1);
 
