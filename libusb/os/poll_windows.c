@@ -12,7 +12,7 @@
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the GNU
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
@@ -29,11 +29,11 @@
  *
  * For USB pollable async I/O, you would typically:
  * - obtain a Windows HANDLE to a file or device that has been opened in
- *   OVERLAPPED mode
+ *	 OVERLAPPED mode
  * - call usbi_create_fd with this handle to obtain a custom fd.
- *   Note that if you need simultaneous R/W access, you need to call create_fd
- *   twice, once in RW_READ and once in RW_WRITE mode to obtain 2 separate
- *   pollable fds
+ *	 Note that if you need simultaneous R/W access, you need to call create_fd
+ *	 twice, once in RW_READ and once in RW_WRITE mode to obtain 2 separate
+ *	 pollable fds
  * - leave the core functions call the poll routine and flag POLLIN/POLLOUT
  *
  * The pipe pollable synchronous I/O works using the overlapped event associated
@@ -72,8 +72,8 @@ struct winfd poll_fd[MAX_FDS];
 
 struct pipe_data {
 	struct list_head list;
-	char * data;
-	int count;
+	unsigned char * data;
+	size_t count;
 };
 
 // internal fd data
@@ -229,6 +229,7 @@ static void free_overlapped(OVERLAPPED *overlapped)
 
 void exit_polling(void)
 {
+	struct pipe_data* item;
 	int i;
 
 	while (InterlockedExchange((LONG *)&compat_spinlock, 1) == 1) {
@@ -251,9 +252,12 @@ void exit_polling(void)
 					CloseHandle(poll_fd[i].handle);
 				}
 			}
-			if (!list_empty(&_poll_id[i].list))
+			if (!list_empty(&_poll_fd[i].list))
 				usbi_warn(NULL, "There are some pending events in the queue");
-			list_for_each_entry(item, &_poll_id[i].data, list, struct pipe_data){
+			list_for_each_entry(item,
+								&_poll_fd[i].list,
+								list,
+								struct pipe_data){
 				free(item->data);
 				free(item);
 			}
@@ -400,6 +404,8 @@ struct winfd usbi_create_fd(HANDLE handle, int access_mode, struct usbi_transfer
 
 static void _free_index(int _index)
 {
+	struct pipe_data *item;
+
 	// Cancel any async IO (Don't care about the validity of our handles for this)
 	cancel_io(_index);
 	// close the duplicate handle (if we have an actual duplicate)
@@ -409,9 +415,9 @@ static void _free_index(int _index)
 		}
 		_poll_fd[_index].original_handle = INVALID_HANDLE_VALUE;
 		_poll_fd[_index].thread_id = 0;
-		if (!list_empty(&_poll_id[i].list))
+		if (!list_empty(&_poll_fd[_index].list))
 			usbi_warn(NULL, "There are some pending events in the queue");
-		list_for_each_entry(item, &_poll_id[i].list, list, struct pipe_data){
+		list_for_each_entry(item, &_poll_fd[_index].list, list, struct pipe_data){
 			free(item->data);
 			free(item);
 		}
@@ -672,8 +678,10 @@ int usbi_close(int fd)
  */
 ssize_t usbi_write(int fd, const void *buf, size_t count)
 {
-	int _index;
+	int _index, i;
+	ssize_t res;
 	struct pipe_data *item;
+	const unsigned char * cbuf = (unsigned char*) buf;
 
 	CHECK_INIT_POLLING;
 
@@ -692,15 +700,22 @@ ssize_t usbi_write(int fd, const void *buf, size_t count)
 		return -1;
 	}
 
-	item = malloc(sizeof(pipe_data));
-	item->data = calloc(count, sizeof(unsigned char));
+	usbi_dbg("Adding %i bytes, list_empty %i",
+			 count,
+			 list_empty(&_poll_fd[_index].list));
+	item = calloc(1, sizeof(*item));
+	item->data = calloc(sizeof(unsigned char), count+1);
 	item->count = count;
-	memcpy(&item->data, buf, count);
-	list_add(&item->list, _poll_fd[_index].list);
+	for(i = 0; i < count ; i++ ){
+		item->data[i] = cbuf[i];
+		poll_dbg("%i -> 0x%02X", i, cbuf[i]);
+	}
+	list_add(&item->list, &_poll_fd[_index].list);
 
-	poll_dbg("set pipe event (fd = %d, thread = %08X)",
+	poll_dbg("set pipe event (fd = %d, thread = %08X, item = %p)",
 			 _index,
-			 GetCurrentThreadId());
+			 GetCurrentThreadId(),
+			 item);
 	SetEvent(poll_fd[_index].overlapped->hEvent);
 	poll_fd[_index].overlapped->Internal = STATUS_WAIT_0;
 	// If two threads write on the pipe at the same time, we need to
@@ -720,7 +735,6 @@ ssize_t usbi_read(int fd, void *buf, size_t count)
 	int _index;
 	int res;
 	ssize_t r = -1;
-	UNUSED(buf);
 
 	CHECK_INIT_POLLING;
 
@@ -743,9 +757,6 @@ ssize_t usbi_read(int fd, void *buf, size_t count)
 		goto out;
 	}
 
-	poll_dbg("clr pipe event (fd = %d, thread = %08X)",
-			 _index,
-			 GetCurrentThreadId());
 	poll_fd[_index].overlapped->InternalHigh--;
 	// Don't reset unless we don't have any more events to process
 	if (poll_fd[_index].overlapped->InternalHigh <= 0) {
@@ -753,13 +764,36 @@ ssize_t usbi_read(int fd, void *buf, size_t count)
 		poll_fd[_index].overlapped->Internal = STATUS_PENDING;
 	}
 
-	pdata = list_entry(_poll_fd[_index].list, struct pipe_data, list);
-	r = memcpy(&buf, pdata->data, MIN(pdata->count, count));
-	list_del(&pdata->list);
-	free(pdata->data);
-	free(pdata);
 
-out:
+	poll_dbg("clr pipe event (fd = %d, thread = %08X, expected = %i)",
+			 _index,
+			 GetCurrentThreadId(),
+			 count
+		);
+
+
+	if (list_empty(&_poll_fd[_index].list)){
+		usbi_warn(NULL, "no data in the poll");
+		r = 0;
+	} else {
+		int i;
+		ssize_t t;
+		unsigned char* cbuf = (unsigned char*) &buf;
+		pdata = list_entry(_poll_fd[_index].list.next, struct pipe_data, list);
+		t = MIN(pdata->count, count);
+		poll_dbg("(item = %p, count = %i", pdata, pdata->count);
+
+		for(i = 0; i < t ; i++ ) {
+			cbuf[i] = pdata->data[i];
+			poll_dbg("0x%02X -> %i, 0x%02X", pdata->data[i], i, cbuf[i]);
+		}
+		free(pdata->data);
+		list_del(&(pdata->list));
+		free(pdata);
+		r = t;
+	}
+
+  out:
 	LeaveCriticalSection(&_poll_fd[_index].mutex);
 	return r;
 }
