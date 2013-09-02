@@ -26,7 +26,7 @@
 int done = 0;
 libusb_device_handle *handle;
 
-static int LIBUSB_CALL hotplug_callback(libusb_context *ctx, libusb_device *dev, libusb_hotplug_event event, void *user_data)
+static int LIBUSB_CALL hotplug_callback_attach(libusb_context *ctx, libusb_device *dev, libusb_hotplug_event event, void *user_data)
 {
 	struct libusb_device_descriptor desc;
 	int rc;
@@ -36,9 +36,9 @@ static int LIBUSB_CALL hotplug_callback(libusb_context *ctx, libusb_device *dev,
 		fprintf (stderr, "Error getting device descriptor\n");
 	}
 
-	printf ("Device attached: %04x:%04x\n", desc.idVendor, desc.idProduct);
-
-	libusb_open (dev, &handle);
+	printf ("Callback Device attached: %04x:%04x\n",
+		desc.idVendor,
+		desc.idProduct);
 
 	done++;
 
@@ -47,9 +47,17 @@ static int LIBUSB_CALL hotplug_callback(libusb_context *ctx, libusb_device *dev,
 
 static int LIBUSB_CALL hotplug_callback_detach(libusb_context *ctx, libusb_device *dev, libusb_hotplug_event event, void *user_data)
 {
-	printf ("Device detached\n");
+	struct libusb_device_descriptor desc;
+	int rc;
 
-	libusb_close (handle);
+	rc = libusb_get_device_descriptor(dev, &desc);
+	if (LIBUSB_SUCCESS != rc) {
+		fprintf (stderr, "Error getting device descriptor\n");
+	}
+
+	printf ("Callback Device detached: %04x:%04x\n",
+		desc.idVendor,
+		desc.idProduct);
 
 	done++;
 	return 0;
@@ -60,12 +68,16 @@ int main(int argc, char *argv[])
 	libusb_hotplug_callback_handle hp[2];
 	int product_id, vendor_id, class_id;
 	int rc;
+	libusb_device **devs;
 
 	vendor_id  = (argc > 1) ? strtol (argv[1], NULL, 0) : 0x045a;
 	product_id = (argc > 2) ? strtol (argv[2], NULL, 0) : 0x5005;
 	class_id   = (argc > 3) ? strtol (argv[3], NULL, 0) : LIBUSB_HOTPLUG_MATCH_ANY;
 
 	libusb_init (NULL);
+
+	libusb_get_device_list(NULL, &devs);
+
 	libusb_set_debug(NULL, 4);
 
 	if (!libusb_has_capability (LIBUSB_CAP_HAS_HOTPLUG)) {
@@ -78,7 +90,11 @@ int main(int argc, char *argv[])
 					      LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED,
 					      0,
 					      vendor_id,
-		product_id, class_id, hotplug_callback, NULL, &hp[0]);
+					      product_id,
+					      class_id,
+					      hotplug_callback_attach,
+					      NULL,
+					      &hp[0]);
 	if (LIBUSB_SUCCESS != rc) {
 		fprintf (stderr, "Error registering callback 0\n");
 		libusb_exit (NULL);
@@ -87,7 +103,7 @@ int main(int argc, char *argv[])
 
 	rc = libusb_hotplug_register_callback (NULL,
 					       LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT,
-					       0,
+					       LIBUSB_HOTPLUG_ENUMERATE,
 					       vendor_id,
 					       product_id,
 					       class_id,
@@ -101,9 +117,11 @@ int main(int argc, char *argv[])
 	}
 
 	fprintf(stdout, "Waiting for events\n");
-	while (done < 2) {
+	while (done < 20) {
 		libusb_handle_events (NULL);
 	}
+
+	libusb_free_device_list(devs, 1);
 
 	libusb_exit (NULL);
 }

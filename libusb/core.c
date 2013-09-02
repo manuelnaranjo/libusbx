@@ -567,9 +567,12 @@ void usbi_disconnect_device(struct libusb_device *dev)
 	dev->attached = 0;
 	usbi_mutex_unlock(&dev->lock);
 
+	usbi_dbg("about to lock");
 	usbi_mutex_lock(&ctx->usb_devs_lock);
 	list_del(&dev->list);
+	usbi_dbg("removed from list");
 	usbi_mutex_unlock(&ctx->usb_devs_lock);
+	usbi_dbg("unlocked");
 
 	/* Signal that an event has occurred for this device if we support hotplug AND
 	 * the hotplug pipe is ready. This prevents an event from getting raised during
@@ -614,13 +617,21 @@ struct libusb_device *usbi_get_device_by_session_id(struct libusb_context *ctx,
 {
 	struct libusb_device *dev;
 	struct libusb_device *ret = NULL;
-
+	int i = 0;
+	usbi_dbg("usbi_get_device_by_session_id lock");
 	usbi_mutex_lock(&ctx->usb_devs_lock);
-	list_for_each_entry(dev, &ctx->usb_devs, list, struct libusb_device)
+	list_for_each_entry(dev, &ctx->usb_devs, list, struct libusb_device) {
 		if (dev->session_data == session_id) {
 			ret = dev;
 			break;
 		}
+		i++;
+		if (i > 200) {
+			usbi_err(ctx, "Found usb_devs list loop, aborting");
+			exit(1);
+		}
+	}
+	usbi_dbg("usbi_get_device_by_session_id unlock");
 	usbi_mutex_unlock(&ctx->usb_devs_lock);
 
 	return ret;
@@ -667,11 +678,17 @@ ssize_t API_EXPORTED libusb_get_device_list(libusb_context *ctx,
 			usbi_backend->hotplug_poll();
 
 		usbi_mutex_lock(&ctx->usb_devs_lock);
+		i = 0;
 		list_for_each_entry(dev, &ctx->usb_devs, list, struct libusb_device) {
+			i++;
 			discdevs = discovered_devs_append(discdevs, dev);
 
 			if (!discdevs) {
 				r = LIBUSB_ERROR_NO_MEM;
+				break;
+			}
+			if ( i>200){
+				usbi_err(NULL, "dev loop found");
 				break;
 			}
 		}
@@ -811,7 +828,7 @@ int API_EXPORTED libusb_get_port_path(libusb_context *ctx, libusb_device *dev,
  * function and make sure that you only access the parent before issuing
  * \ref libusb_free_device_list(). The reason is that libusbx currently does
  * not maintain a permanent list of device instances, and therefore can
- * only guarantee that parents are fully instantiated within a 
+ * only guarantee that parents are fully instantiated within a
  * libusb_get_device_list() - libusb_free_device_list() block.
  */
 DEFAULT_VISIBILITY
@@ -988,9 +1005,11 @@ void API_EXPORTED libusb_unref_device(libusb_device *dev)
 	if (!dev)
 		return;
 
+	usbi_dbg("about to lock");
 	usbi_mutex_lock(&dev->lock);
 	refcnt = --dev->refcnt;
 	usbi_mutex_unlock(&dev->lock);
+	usbi_dbg("unlocked");
 
 	if (refcnt == 0) {
 		usbi_dbg("destroy device %d.%d", dev->bus_number, dev->device_address);
@@ -1007,6 +1026,7 @@ void API_EXPORTED libusb_unref_device(libusb_device *dev)
 
 		usbi_mutex_destroy(&dev->lock);
 		free(dev);
+		usbi_dbg("destroyed");
 	}
 }
 
@@ -1817,7 +1837,7 @@ int API_EXPORTED libusb_init(libusb_context **context)
 		goto err_unlock;
 	}
 
-#ifdef ENABLE_DEBUG_LOGGING
+#if ENABLE_DEBUG_LOGGING == 1
 	ctx->debug = LIBUSB_LOG_LEVEL_DEBUG;
 #endif
 

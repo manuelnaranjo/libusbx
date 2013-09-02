@@ -570,7 +570,7 @@ void my_close_handle(libusb_device_handle *handle)
  * should stop the thread at program exit as follows:
 \code
 void my_libusb_exit(void)
-{ 
+{
     event_thread_run = 0;
     libusb_hotplug_deregister_callback(ctx, hotplug_cb_handle); // This wakes up libusb_handle_events()
     pthread_join(event_thread);
@@ -610,7 +610,7 @@ void my_libusb_exit(void)
  * descriptors in your main event loop, you must also consider that libusbx
  * sometimes needs to be called into at fixed points in time even when there
  * is no file descriptor activity, see \ref polltime details.
- * 
+ *
  * In order to know precisely when libusbx needs to be called into, libusbx
  * offers you a set of pollable file descriptors and information about when
  * the next timeout expires.
@@ -2007,6 +2007,8 @@ static int handle_events(struct libusb_context *ctx, struct timeval *tv)
 			goto handled;
 		}
 
+		usbi_dbg("event %p %p %i", &message,
+			 message.device, message.event);
 		usbi_hotplug_match(ctx, message.device, message.event);
 
 		/* the device left. dereference the device */

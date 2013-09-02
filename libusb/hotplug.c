@@ -142,8 +142,7 @@ static int usbi_hotplug_match_cb (struct libusb_context *ctx,
 	struct libusb_device *dev, libusb_hotplug_event event,
 	struct libusb_hotplug_callback *hotplug_cb)
 {
-	usbi_dbg("usbi_hotplug_match_cb vid: %p 0x%04X pid: 0x%04X event: %i",
-		 dev,
+	usbi_dbg("usbi_hotplug_match_cb vid: 0x%04X pid: 0x%04X event: %i",
 		 dev->device_descriptor.idVendor,
 		 dev->device_descriptor.idProduct,
 		 event);
@@ -211,6 +210,7 @@ int API_EXPORTED libusb_hotplug_register_callback(libusb_context *ctx,
 	libusb_hotplug_callback_fn cb_fn, void *user_data,
 	libusb_hotplug_callback_handle *handle)
 {
+	int i = 0;
 	libusb_hotplug_callback *new_callback;
 	static int handle_id = 1;
 
@@ -255,12 +255,14 @@ int API_EXPORTED libusb_hotplug_register_callback(libusb_context *ctx,
 	if (flags & LIBUSB_HOTPLUG_ENUMERATE) {
 		struct libusb_device *dev;
 
+		usbi_dbg("locking usb_devs_lock");
 		usbi_mutex_lock(&ctx->usb_devs_lock);
 
 		list_for_each_entry(dev, &ctx->usb_devs, list, struct libusb_device) {
 			(void) usbi_hotplug_match_cb (ctx, dev, LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED, new_callback);
 		}
 
+		usbi_dbg("unlocking usb_devs_lock");
 		usbi_mutex_unlock(&ctx->usb_devs_lock);
 	}
 
