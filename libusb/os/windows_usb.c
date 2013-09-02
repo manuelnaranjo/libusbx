@@ -1328,7 +1328,8 @@ void windows_hotplug_poll_internal(struct libusb_context *ctx){
 					}
 					usbi_dbg("allocating new device for session [%X] %s",
 							 session_id, dev_id_path);
-					if ((dev = usbi_alloc_device(ctx, session_id)) == NULL) {
+					dev = usbi_alloc_device(ctx, session_id);
+					if (dev == NULL) {
 						usbi_err(NULL, "usbi_alloc_device failed");
 						LOOP_BREAK(LIBUSB_ERROR_NO_MEM);
 					}
@@ -1415,7 +1416,7 @@ void windows_hotplug_poll_internal(struct libusb_context *ctx){
 					if (r != LIBUSB_SUCCESS){
 						continue;
 					}
-					usbi_connect_device(dev);
+					//usbi_connect_device(dev);
 				} else if (r == LIBUSB_ERROR_NO_DEVICE) {
 					// This can occur if the device was disconnected but Windows
 					// hasn't refreshed its enumeration yet - in that case, we
