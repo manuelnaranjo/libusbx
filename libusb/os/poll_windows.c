@@ -71,18 +71,18 @@ const struct winfd INVALID_WINFD = {-1, INVALID_HANDLE_VALUE, NULL, NULL, NULL, 
 struct winfd poll_fd[MAX_FDS];
 
 struct pipe_data {
-    struct list_head list;
-    char * data;
-    int count;
+	struct list_head list;
+	char * data;
+	int count;
 };
 
 // internal fd data
 struct {
-    CRITICAL_SECTION mutex; // lock for fds
-    // Additional variables for XP CancelIoEx partial emulation
-    HANDLE original_handle;
-    DWORD thread_id;
-    struct list_head data; // used for sending data between threads
+	CRITICAL_SECTION mutex; // lock for fds
+	// Additional variables for XP CancelIoEx partial emulation
+	HANDLE original_handle;
+	DWORD thread_id;
+	struct list_head list; // used for sending data between threads
 } _poll_fd[MAX_FDS];
 
 // globals
@@ -160,23 +160,23 @@ static __inline BOOL cancel_io(int _index)
 // Init
 void init_polling(void)
 {
-    int i;
+	int i;
 
-    while (InterlockedExchange((LONG *)&compat_spinlock, 1) == 1) {
-        SleepEx(0, TRUE);
-    }
-    if (!is_polling_set) {
-        setup_cancel_io();
-        for (i=0; i<MAX_FDS; i++) {
-            poll_fd[i] = INVALID_WINFD;
-            _poll_fd[i].original_handle = INVALID_HANDLE_VALUE;
-            _poll_fd[i].thread_id = 0;
-            list_init(&_poll_fd[i].data);
-            InitializeCriticalSection(&_poll_fd[i].mutex);
-        }
-        is_polling_set = TRUE;
-    }
-    InterlockedExchange((LONG *)&compat_spinlock, 0);
+	while (InterlockedExchange((LONG *)&compat_spinlock, 1) == 1) {
+		SleepEx(0, TRUE);
+	}
+	if (!is_polling_set) {
+		setup_cancel_io();
+		for (i=0; i<MAX_FDS; i++) {
+			poll_fd[i] = INVALID_WINFD;
+			_poll_fd[i].original_handle = INVALID_HANDLE_VALUE;
+			_poll_fd[i].thread_id = 0;
+			list_init(&_poll_fd[i].list);
+			InitializeCriticalSection(&_poll_fd[i].mutex);
+		}
+		is_polling_set = TRUE;
+	}
+	InterlockedExchange((LONG *)&compat_spinlock, 0);
 }
 
 // Internal function to retrieve the table index (and lock the fd mutex)
@@ -229,40 +229,40 @@ static void free_overlapped(OVERLAPPED *overlapped)
 
 void exit_polling(void)
 {
-    int i;
+	int i;
 
-    while (InterlockedExchange((LONG *)&compat_spinlock, 1) == 1) {
-        SleepEx(0, TRUE);
-    }
-    if (is_polling_set) {
-        is_polling_set = FALSE;
+	while (InterlockedExchange((LONG *)&compat_spinlock, 1) == 1) {
+		SleepEx(0, TRUE);
+	}
+	if (is_polling_set) {
+		is_polling_set = FALSE;
 
-        for (i=0; i<MAX_FDS; i++) {
-            // Cancel any async I/O (handle can be invalid)
-            cancel_io(i);
-            // If anything was pending on that I/O, it should be
-            // terminating, and we should be able to access the fd
-            // mutex lock before too long
-            EnterCriticalSection(&_poll_fd[i].mutex);
-            free_overlapped(poll_fd[i].overlapped);
-            if (Use_Duplicate_Handles) {
-                // Close duplicate handle
-                if (_poll_fd[i].original_handle != INVALID_HANDLE_VALUE) {
-                    CloseHandle(poll_fd[i].handle);
-                }
-            }
-            if (!list_empty(&_poll_id[i].data))
-                usbi_warn(NULL, "There are some pending events in the queue");
-            list_for_each_entry(item, &_poll_id[i].data, list, struct pipe_data){
-                free(item->data);
-                free(item);
-            }
-            poll_fd[i] = INVALID_WINFD;
-            LeaveCriticalSection(&_poll_fd[i].mutex);
-            DeleteCriticalSection(&_poll_fd[i].mutex);
-        }
-    }
-    InterlockedExchange((LONG *)&compat_spinlock, 0);
+		for (i=0; i<MAX_FDS; i++) {
+			// Cancel any async I/O (handle can be invalid)
+			cancel_io(i);
+			// If anything was pending on that I/O, it should be
+			// terminating, and we should be able to access the fd
+			// mutex lock before too long
+			EnterCriticalSection(&_poll_fd[i].mutex);
+			free_overlapped(poll_fd[i].overlapped);
+			if (Use_Duplicate_Handles) {
+				// Close duplicate handle
+				if (_poll_fd[i].original_handle != INVALID_HANDLE_VALUE) {
+					CloseHandle(poll_fd[i].handle);
+				}
+			}
+			if (!list_empty(&_poll_id[i].list))
+				usbi_warn(NULL, "There are some pending events in the queue");
+			list_for_each_entry(item, &_poll_id[i].data, list, struct pipe_data){
+				free(item->data);
+				free(item);
+			}
+			poll_fd[i] = INVALID_WINFD;
+			LeaveCriticalSection(&_poll_fd[i].mutex);
+			DeleteCriticalSection(&_poll_fd[i].mutex);
+		}
+	}
+	InterlockedExchange((LONG *)&compat_spinlock, 0);
 }
 
 /*
@@ -273,48 +273,48 @@ void exit_polling(void)
  */
 int usbi_pipe(int filedes[2])
 {
-    int i;
-    OVERLAPPED* overlapped;
+	int i;
+	OVERLAPPED* overlapped;
 
-    CHECK_INIT_POLLING;
+	CHECK_INIT_POLLING;
 
-    overlapped = create_overlapped();
+	overlapped = create_overlapped();
 
-    if (overlapped == NULL) {
-        return -1;
-    }
-    // The overlapped must have status pending for signaling to work in poll
-    overlapped->Internal = STATUS_PENDING;
-    overlapped->InternalHigh = 0;
+	if (overlapped == NULL) {
+		return -1;
+	}
+	// The overlapped must have status pending for signaling to work in poll
+	overlapped->Internal = STATUS_PENDING;
+	overlapped->InternalHigh = 0;
 
-    for (i=0; i<MAX_FDS; i++) {
-        if (poll_fd[i].fd < 0) {
-            EnterCriticalSection(&_poll_fd[i].mutex);
-            // fd might have been allocated before we got to critical
-            if (poll_fd[i].fd >= 0) {
-                LeaveCriticalSection(&_poll_fd[i].mutex);
-                continue;
-            }
+	for (i=0; i<MAX_FDS; i++) {
+		if (poll_fd[i].fd < 0) {
+			EnterCriticalSection(&_poll_fd[i].mutex);
+			// fd might have been allocated before we got to critical
+			if (poll_fd[i].fd >= 0) {
+				LeaveCriticalSection(&_poll_fd[i].mutex);
+				continue;
+			}
 
-            // Use index as the unique fd number
-            poll_fd[i].fd = i;
-            // Read end of the "pipe"
-            filedes[0] = poll_fd[i].fd;
-            // We can use the same handle for both ends
-            filedes[1] = filedes[0];
+			// Use index as the unique fd number
+			poll_fd[i].fd = i;
+			// Read end of the "pipe"
+			filedes[0] = poll_fd[i].fd;
+			// We can use the same handle for both ends
+			filedes[1] = filedes[0];
 
-            poll_fd[i].handle = DUMMY_HANDLE;
-            poll_fd[i].overlapped = overlapped;
-            // There's no polling on the write end, so we just use READ for
-            // our needs
-            poll_fd[i].rw = RW_READ;
-            _poll_fd[i].original_handle = INVALID_HANDLE_VALUE;
-            LeaveCriticalSection(&_poll_fd[i].mutex);
-            return 0;
-        }
-    }
-    free_overlapped(overlapped);
-    return -1;
+			poll_fd[i].handle = DUMMY_HANDLE;
+			poll_fd[i].overlapped = overlapped;
+			// There's no polling on the write end, so we just use READ for
+			// our needs
+			poll_fd[i].rw = RW_READ;
+			_poll_fd[i].original_handle = INVALID_HANDLE_VALUE;
+			LeaveCriticalSection(&_poll_fd[i].mutex);
+			return 0;
+		}
+	}
+	free_overlapped(overlapped);
+	return -1;
 }
 
 /*
@@ -400,24 +400,24 @@ struct winfd usbi_create_fd(HANDLE handle, int access_mode, struct usbi_transfer
 
 static void _free_index(int _index)
 {
-    // Cancel any async IO (Don't care about the validity of our handles for this)
-    cancel_io(_index);
-    // close the duplicate handle (if we have an actual duplicate)
-    if (Use_Duplicate_Handles) {
-        if (_poll_fd[_index].original_handle != INVALID_HANDLE_VALUE) {
-            CloseHandle(poll_fd[_index].handle);
-        }
-        _poll_fd[_index].original_handle = INVALID_HANDLE_VALUE;
-        _poll_fd[_index].thread_id = 0;
-        if (!list_empty(&_poll_id[i].data))
-            usbi_warn(NULL, "There are some pending events in the queue");
-        list_for_each_entry(item, &_poll_id[i].data, list, struct pipe_data){
-            free(item->data);
-            free(item);
-        }
-    }
-    free_overlapped(poll_fd[_index].overlapped);
-    poll_fd[_index] = INVALID_WINFD;
+	// Cancel any async IO (Don't care about the validity of our handles for this)
+	cancel_io(_index);
+	// close the duplicate handle (if we have an actual duplicate)
+	if (Use_Duplicate_Handles) {
+		if (_poll_fd[_index].original_handle != INVALID_HANDLE_VALUE) {
+			CloseHandle(poll_fd[_index].handle);
+		}
+		_poll_fd[_index].original_handle = INVALID_HANDLE_VALUE;
+		_poll_fd[_index].thread_id = 0;
+		if (!list_empty(&_poll_id[i].list))
+			usbi_warn(NULL, "There are some pending events in the queue");
+		list_for_each_entry(item, &_poll_id[i].list, list, struct pipe_data){
+			free(item->data);
+			free(item);
+		}
+	}
+	free_overlapped(poll_fd[_index].overlapped);
+	poll_fd[_index] = INVALID_WINFD;
 }
 
 /*
@@ -595,7 +595,7 @@ int usbi_poll(struct pollfd *fds, unsigned int nfds, int timeout)
 		// The following macro only works if overlapped I/O was reported pending
 		if ( (HasOverlappedIoCompleted(poll_fd[_index].overlapped))
 		  || (HasOverlappedIoCompletedSync(poll_fd[_index].overlapped)) ) {
-			poll_dbg("  completed");
+			poll_dbg("	completed");
 			// checks above should ensure this works:
 			fds[i].revents = fds[i].events;
 			triggered++;
@@ -618,7 +618,7 @@ int usbi_poll(struct pollfd *fds, unsigned int nfds, int timeout)
 			FALSE, (timeout<0)?INFINITE:(DWORD)timeout);
 		object_index = ret-WAIT_OBJECT_0;
 		if ((object_index >= 0) && ((DWORD)object_index < nb_handles_to_wait_on)) {
-			poll_dbg("  completed after wait");
+			poll_dbg("	completed after wait");
 			i = handle_to_index[object_index];
 			_index = _fd_to_index_and_lock(fds[i].fd);
 			fds[i].revents = fds[i].events;
@@ -627,7 +627,7 @@ int usbi_poll(struct pollfd *fds, unsigned int nfds, int timeout)
 				LeaveCriticalSection(&_poll_fd[_index].mutex);
 			}
 		} else if (ret == WAIT_TIMEOUT) {
-			poll_dbg("  timed out");
+			poll_dbg("	timed out");
 			triggered = 0;	// 0 = timeout
 		} else {
 			errno = EIO;
@@ -673,9 +673,7 @@ int usbi_close(int fd)
 ssize_t usbi_write(int fd, const void *buf, size_t count)
 {
 	int _index;
-        struct list_head *item;
-        char * cbuf;
-	UNUSED(buf);
+	struct pipe_data *item;
 
 	CHECK_INIT_POLLING;
 
@@ -694,11 +692,15 @@ ssize_t usbi_write(int fd, const void *buf, size_t count)
 		return -1;
 	}
 
-        cbuf = malloc(count);
-        item =
+	item = malloc(sizeof(pipe_data));
+	item->data = calloc(count, sizeof(unsigned char));
+	item->count = count;
+	memcpy(&item->data, buf, count);
+	list_add(&item->list, _poll_fd[_index].list);
+
 	poll_dbg("set pipe event (fd = %d, thread = %08X)",
-                 _index,
-                 GetCurrentThreadId());
+			 _index,
+			 GetCurrentThreadId());
 	SetEvent(poll_fd[_index].overlapped->hEvent);
 	poll_fd[_index].overlapped->Internal = STATUS_WAIT_0;
 	// If two threads write on the pipe at the same time, we need to
@@ -714,45 +716,50 @@ ssize_t usbi_write(int fd, const void *buf, size_t count)
  */
 ssize_t usbi_read(int fd, void *buf, size_t count)
 {
-    int _index;
-    int res;
-    ssize_t r = -1;
-    UNUSED(buf);
+	struct pipe_data * pdata;
+	int _index;
+	int res;
+	ssize_t r = -1;
+	UNUSED(buf);
 
-    CHECK_INIT_POLLING;
+	CHECK_INIT_POLLING;
 
-    //if (count != sizeof(unsigned char)) {
-    //	usbi_err(NULL, "this function should only used for signaling");
-    //	return -1;
-    //}
+	//if (count != sizeof(unsigned char)) {
+	//	usbi_err(NULL, "this function should only used for signaling");
+	//	return -1;
+	//}
 
-    _index = _fd_to_index_and_lock(fd);
+	_index = _fd_to_index_and_lock(fd);
 
-    if (_index < 0) {
-        errno = EBADF;
-        return -1;
-    }
+	if (_index < 0) {
+		errno = EBADF;
+		return -1;
+	}
 
-    res = WaitForSingleObject(poll_fd[_index].overlapped->hEvent, INFINITE);
-    if (res != WAIT_OBJECT_0) {
-        usbi_warn(NULL, "waiting for event failed: %d", (int)GetLastError());
-        errno = EIO;
-        goto out;
-    }
+	res = WaitForSingleObject(poll_fd[_index].overlapped->hEvent, INFINITE);
+	if (res != WAIT_OBJECT_0) {
+		usbi_warn(NULL, "waiting for event failed: %d", (int)GetLastError());
+		errno = EIO;
+		goto out;
+	}
 
-    poll_dbg("clr pipe event (fd = %d, thread = %08X)",
-             _index,
-             GetCurrentThreadId());
-    poll_fd[_index].overlapped->InternalHigh--;
-    // Don't reset unless we don't have any more events to process
-    if (poll_fd[_index].overlapped->InternalHigh <= 0) {
-        ResetEvent(poll_fd[_index].overlapped->hEvent);
-        poll_fd[_index].overlapped->Internal = STATUS_PENDING;
-    }
+	poll_dbg("clr pipe event (fd = %d, thread = %08X)",
+			 _index,
+			 GetCurrentThreadId());
+	poll_fd[_index].overlapped->InternalHigh--;
+	// Don't reset unless we don't have any more events to process
+	if (poll_fd[_index].overlapped->InternalHigh <= 0) {
+		ResetEvent(poll_fd[_index].overlapped->hEvent);
+		poll_fd[_index].overlapped->Internal = STATUS_PENDING;
+	}
 
-    r = count;
+	pdata = list_entry(_poll_fd[_index].list, struct pipe_data, list);
+	r = memcpy(&buf, pdata->data, MIN(pdata->count, count));
+	list_del(&pdata->list);
+	free(pdata->data);
+	free(pdata);
 
 out:
-    LeaveCriticalSection(&_poll_fd[_index].mutex);
-    return r;
+	LeaveCriticalSection(&_poll_fd[_index].mutex);
+	return r;
 }
