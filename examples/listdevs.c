@@ -56,21 +56,27 @@ int main(void)
 	ssize_t cnt;
 
 	r = libusb_init(NULL);
-        printf("libusb init %i\n", r);
+	printf("libusb init %i\n", r);
 	if (r < 0)
 		return r;
 
-        libusb_set_debug(NULL, 4);
+	libusb_set_debug(NULL, 4);
 
 
 	cnt = libusb_get_device_list(NULL, &devs);
 	printf("Device count %i\n", cnt);
-        if (cnt < 0) {
-            return (int) cnt;
-        }
+	if (cnt < 0) {
+		return (int) cnt;
+	}
 	print_devs(devs);
 	libusb_free_device_list(devs, 1);
 
 	libusb_exit(NULL);
 	return 0;
 }
+
+/* Local Variables: */
+/* mode: C */
+/* c-basic-offset: 8 */
+/* indent-tabs-mode: t */
+/* End: */

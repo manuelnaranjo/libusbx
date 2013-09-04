@@ -924,3 +924,9 @@ DLL_DECLARE(WINAPI, BOOL, HidP_GetValueCaps, (HIDP_REPORT_TYPE, PHIDP_VALUE_CAPS
 #define GEN_PASS 2
 #define DEV_PASS 3
 #define HID_PASS 4
+
+/* Local Variables: */
+/* mode: c */
+/* c-basic-offset: 8 */
+/* indent-tabs-mode: t */
+/* End: */
