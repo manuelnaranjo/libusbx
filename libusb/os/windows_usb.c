@@ -5012,3 +5012,9 @@ static int composite_copy_transfer_data(int sub_api, struct usbi_transfer *itran
 	return priv->usb_interface[transfer_priv->interface_number].apib->
 		copy_transfer_data(priv->usb_interface[transfer_priv->interface_number].sub_api, itransfer, io_size);
 }
+
+/* Local Variables: */
+/* mode: c */
+/* c-basic-offset: 8 */
+/* indent-tabs-mode: t */
+/* End: */

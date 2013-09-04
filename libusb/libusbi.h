@@ -1004,4 +1004,10 @@ extern const struct usbi_os_backend wince_backend;
 extern struct list_head active_contexts_list;
 extern usbi_mutex_static_t active_contexts_lock;
 
+/* Local Variables: */
+/* mode: c */
+/* c-basic-offset: 8 */
+/* indent-tabs-mode: t */
+/* End: */
+
 #endif

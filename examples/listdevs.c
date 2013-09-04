@@ -71,3 +71,9 @@ int main(void)
 	libusb_exit(NULL);
 	return 0;
 }
+
+/* Local Variables: */
+/* mode: C */
+/* c-basic-offset: 8 */
+/* indent-tabs-mode: t */
+/* End: */

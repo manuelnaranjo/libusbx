@@ -802,3 +802,9 @@ ssize_t usbi_read(int fd, void *buf, size_t count)
 	LeaveCriticalSection(&_poll_fd[_index].mutex);
 	return r;
 }
+
+/* Local Variables: */
+/* mode: c */
+/* c-basic-offset: 8 */
+/* indent-tabs-mode: t */
+/* End: */

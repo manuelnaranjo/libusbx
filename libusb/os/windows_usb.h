@@ -24,6 +24,17 @@
 
 #include "windows_common.h"
 
+#include "setupapi.h"
+#include "winnt.h"
+
+#ifndef PCTSTR
+#ifdef UNICODE
+ typedef LPCWSTR PCTSTR;
+#else
+ typedef LPCSTR PCTSTR;
+#endif
+#endif
+
 #if defined(_MSC_VER)
 // disable /W4 MSVC warnings that are benign
 #pragma warning(disable:4127) // conditional expression is constant
@@ -205,69 +216,38 @@ struct hid_device_priv {
 
 typedef struct libusb_device_descriptor USB_DEVICE_DESCRIPTOR, *PUSB_DEVICE_DESCRIPTOR;
 struct windows_device_priv {
-	uint8_t depth;						// distance to HCD
-	uint8_t port;						// port number on the hub
+	uint8_t depth; // distance to HCD
+	uint8_t port; // port number on the hub
 	uint8_t active_config;
-	struct libusb_device *parent_dev;	// access to parent is required for usermode ops
 	struct windows_usb_api_backend const *apib;
-	char *path;							// device interface path
-	int sub_api;						// for WinUSB-like APIs
+	char *path; // device interface path
+	int sub_api; // for WinUSB-like APIs
 	struct {
-		char *path;						// each interface needs a device interface path,
-		struct windows_usb_api_backend const *apib; // an API backend (multiple drivers support),
+		char *path; // each interface needs a device interface path,
+		// an API backend (multiple drivers support),
+		struct windows_usb_api_backend const *apib;
 		int sub_api;
-		int8_t nb_endpoints;			// and a set of endpoint addresses (USB_MAXENDPOINTS)
+		// and a set of endpoint addresses (USB_MAXENDPOINTS)
+		int8_t nb_endpoints;
 		uint8_t *endpoint;
-		bool restricted_functionality;	// indicates if the interface functionality is restricted
-										// by Windows (eg. HID keyboards or mice cannot do R/W)
+		// indicates if the interface functionality is restricted
+		bool restricted_functionality;
+		// by Windows (eg. HID keyboards or mice cannot do R/W)
 	} usb_interface[USB_MAXINTERFACES];
 	struct hid_device_priv *hid;
 	USB_DEVICE_DESCRIPTOR dev_descriptor;
-	unsigned char **config_descriptor;	// list of pointers to the cached config descriptors
+	// list of pointers to the cached config descriptors
+	unsigned char **config_descriptor;
 };
 
 static inline struct windows_device_priv *_device_priv(struct libusb_device *dev) {
+	if (dev == NULL)
+		return NULL;
 	return (struct windows_device_priv *)dev->os_priv;
 }
 
-static inline void windows_device_priv_init(libusb_device* dev) {
-	struct windows_device_priv* p = _device_priv(dev);
-	int i;
-	p->depth = 0;
-	p->port = 0;
-	p->parent_dev = NULL;
-	p->path = NULL;
-	p->apib = &usb_api_backend[USB_API_UNSUPPORTED];
-	p->sub_api = SUB_API_NOTSET;
-	p->hid = NULL;
-	p->active_config = 0;
-	p->config_descriptor = NULL;
-	memset(&(p->dev_descriptor), 0, sizeof(USB_DEVICE_DESCRIPTOR));
-	for (i=0; i<USB_MAXINTERFACES; i++) {
-		p->usb_interface[i].path = NULL;
-		p->usb_interface[i].apib = &usb_api_backend[USB_API_UNSUPPORTED];
-		p->usb_interface[i].sub_api = SUB_API_NOTSET;
-		p->usb_interface[i].nb_endpoints = 0;
-		p->usb_interface[i].endpoint = NULL;
-		p->usb_interface[i].restricted_functionality = false;
-	}
-}
-
-static inline void windows_device_priv_release(libusb_device* dev) {
-	struct windows_device_priv* p = _device_priv(dev);
-	int i;
-	safe_free(p->path);
-	if ((dev->num_configurations > 0) && (p->config_descriptor != NULL)) {
-		for (i=0; i < dev->num_configurations; i++)
-			safe_free(p->config_descriptor[i]);
-	}
-	safe_free(p->config_descriptor);
-	safe_free(p->hid);
-	for (i=0; i<USB_MAXINTERFACES; i++) {
-		safe_free(p->usb_interface[i].path);
-		safe_free(p->usb_interface[i].endpoint);
-	}
-}
+static inline void windows_device_priv_init(libusb_device* dev);
+static inline void windows_device_priv_release(libusb_device* dev);
 
 struct interface_handle_t {
 	HANDLE dev_handle; // WinUSB needs an extra handle for the file
@@ -307,6 +287,7 @@ DLL_DECLARE_PREFIXED(WINAPI, HRESULT, p, CLSIDFromString, (LPCOLESTR, LPCLSID));
 
 /* SetupAPI dependencies */
 DLL_DECLARE_PREFIXED(WINAPI, HDEVINFO, p, SetupDiGetClassDevsA, (const GUID*, PCSTR, HWND, DWORD));
+DLL_DECLARE_PREFIXED(WINAPI, HDEVINFO, p, SetupDiGetClassDevsExA, (const GUID*, PCSTR, HWND, DWORD, HDEVINFO, PCTSTR, PVOID));
 DLL_DECLARE_PREFIXED(WINAPI, BOOL, p, SetupDiEnumDeviceInfo, (HDEVINFO, DWORD, PSP_DEVINFO_DATA));
 DLL_DECLARE_PREFIXED(WINAPI, BOOL, p, SetupDiEnumDeviceInterfaces, (HDEVINFO, PSP_DEVINFO_DATA,
 			const GUID*, DWORD, PSP_DEVICE_INTERFACE_DATA));
@@ -916,3 +897,16 @@ DLL_DECLARE(WINAPI, BOOL, HidD_GetInputReport, (HANDLE, PVOID, ULONG));
 DLL_DECLARE(WINAPI, BOOL, HidD_SetOutputReport, (HANDLE, PVOID, ULONG));
 DLL_DECLARE(WINAPI, BOOL, HidD_FlushQueue, (HANDLE));
 DLL_DECLARE(WINAPI, BOOL, HidP_GetValueCaps, (HIDP_REPORT_TYPE, PHIDP_VALUE_CAPS, PULONG, PHIDP_PREPARSED_DATA));
+
+#define MAX_ENUM_GUIDS 64
+#define HCD_PASS 0
+#define HUB_PASS 1
+#define GEN_PASS 2
+#define DEV_PASS 3
+#define HID_PASS 4
+
+/* Local Variables: */
+/* mode: c */
+/* c-basic-offset: 8 */
+/* indent-tabs-mode: t */
+/* End: */
