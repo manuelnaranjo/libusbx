@@ -255,10 +255,16 @@ void exit_polling(void)
 			if (!list_empty(&_poll_fd[i].list))
 				usbi_warn(NULL, "There are some pending events in the queue");
 			list_for_each_entry(item,
-								&_poll_fd[i].list,
-								list,
-								struct pipe_data){
-				free(item->data);
+					    &_poll_fd[i].list,
+					    list,
+					    struct pipe_data){
+				if (!item){
+					usbi_err(NULL, "no item to free");
+					continue;
+				}
+				if (item->data)
+					free(item->data);
+
 				free(item);
 			}
 			poll_fd[i] = INVALID_WINFD;
@@ -418,7 +424,12 @@ static void _free_index(int _index)
 		if (!list_empty(&_poll_fd[_index].list))
 			usbi_warn(NULL, "There are some pending events in the queue");
 		list_for_each_entry(item, &_poll_fd[_index].list, list, struct pipe_data){
-			free(item->data);
+			if (!item) {
+				usbi_dbg("no item");
+				continue;
+			}
+			if (item->data)
+				free(item->data);
 			free(item);
 		}
 	}
@@ -774,11 +785,24 @@ ssize_t usbi_read(int fd, void *buf, size_t count)
 		ssize_t t;
 		unsigned char* cbuf = (unsigned char*) buf;
 		pdata = list_entry(_poll_fd[_index].list.next, struct pipe_data, list);
+		if (pdata == NULL) {
+			usbi_err(NULL, "no pdata");
+			r = 0;
+			goto out;
+		}
+
+		if (pdata->data == NULL){
+			usbi_err(NULL, "no data");
+			r = 0;
+			goto out;
+		}
+
 		t = MIN(pdata->count, count);
 
 		for(i = 0; i < t ; i++ ) {
 			cbuf[i] = pdata->data[i];
 		}
+
 		free(pdata->data);
 		list_del(&(pdata->list));
 		free(pdata);
