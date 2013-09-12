@@ -881,9 +881,9 @@ static void auto_release(struct usbi_transfer *itransfer)
  * hotplugged detected device, parents are created or automatically if the
  * device is recently connected, otherwise it returns the one from the cache.
  */
-struct libusb_device * get_hotplug_device_node(
-	DEV_BROADCAST_DEVICEINTERFACE *dev_bdi, struct libusb_context* ctx,
-	int online )
+struct libusb_device * get_hotplug_device_node( const char* name,
+						struct libusb_context* ctx,
+						int online )
 {
 	TCHAR* devId = NULL, *class = NULL, *guid = NULL,
 		*dev_interface_path = NULL, *dev_id_path = NULL;
@@ -896,15 +896,15 @@ struct libusb_device * get_hotplug_device_node(
 	struct libusb_device * dev = NULL, * parent_dev = NULL;
 	struct windows_device_priv *priv;
 
-	usbi_dbg(dev_bdi->dbcc_name);
+	usbi_dbg(name);
 
-	nlen = strlen(dev_bdi->dbcc_name);
+	nlen = strlen(name);
 	if (nlen<5){
-		usbi_err(ctx, "dbcc_name not long enough");
+		usbi_err(ctx, "name not long enough");
 		return NULL;
 	}
 
-	dev_interface_path = sanitize_path(dev_bdi->dbcc_name);
+	dev_interface_path = sanitize_path(name);
 	session_id = htab_hash(dev_interface_path);
 	if (usbi_get_device_by_session_id(ctx, session_id)){
 		usbi_info(ctx, "found device in session");
@@ -913,7 +913,7 @@ struct libusb_device * get_hotplug_device_node(
 	}
 
 	devId = (TCHAR*)calloc(sizeof(TCHAR), nlen);
-	strcpy(devId, dev_bdi->dbcc_name+4);
+	strcpy(devId, name+4);
 	for (i = nlen-5; i>-1 ; i--){
 		if (devId[i] == '#')
 			break;
@@ -921,7 +921,7 @@ struct libusb_device * get_hotplug_device_node(
 	devId[i] = 0;
 
 	guid = (TCHAR*)calloc(sizeof(TCHAR), nlen-i);
-	strcpy(guid, dev_bdi->dbcc_name+i+5);
+	strcpy(guid, name+i+5);
 	for ( i = 0; i < strlen(guid); i++ ) {
 		guid[i] = toupper(guid[i]);
 	}
@@ -1101,14 +1101,14 @@ struct libusb_device * get_hotplug_device_node(
 	ret = init_device(dev, parent_dev, (uint8_t) port_nr, dev_id_path,
 			  dev_info_data.DevInst);
 	if (ret != LIBUSB_SUCCESS) {
-		usbi_err(ctx, "initialization failed");
+		usbi_err(ctx, "init device failed");
 		libusb_unref_device(dev);
 		dev = NULL;
 		goto cleanup;
 	}
 	ret =  usbi_sanitize_device(dev);
 	if (ret != LIBUSB_SUCCESS) {
-		usbi_err(ctx, "sanitizion failed");
+		usbi_err(ctx, "sanitaze failed");
 		libusb_unref_device(dev);
 		dev = NULL;
 		goto cleanup;
@@ -1132,54 +1132,34 @@ LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
 						       WPARAM wParam,
 						       LPARAM lParam)
 {
-	LRESULT ret = TRUE;
 	DEV_BROADCAST_HDR* dev_bhd;
 	DEV_BROADCAST_DEVICEINTERFACE* dev_bdi;
 	struct libusb_device *dev;
 	struct libusb_context *ctx;
-	char* hotplug_path;
 	bool online;
 	ssize_t i;
 
 	if (wParam != DBT_DEVICEARRIVAL && wParam != DBT_DEVICEREMOVECOMPLETE) {
-		return ret;
+		return TRUE;
 	}
 
 	dev_bhd = (DEV_BROADCAST_HDR*)lParam;
 	usbi_err(NULL, "dbt_arrival %i", dev_bhd->dbch_devicetype);
 	if (dev_bhd->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE ) {
-		return ret;
+		return TRUE;
 	}
 
 	dev_bdi = (DEV_BROADCAST_DEVICEINTERFACE*)dev_bhd;
-	// We assert that a device interface path is just a device id plus a GUID
-	for (i = safe_strlen(dev_bdi->dbcc_name)-38; i >= 0; ) {
-		// GUID is 38 chars
-		if (dev_bdi->dbcc_name[i--] == '{' && dev_bdi->dbcc_name[i--] == '#'){
-			dev_bdi->dbcc_name[++i] = 0;
-			break;
-		}
-	}
-
-	if (i < 0) {
-		usbi_err(NULL, "%s is not a device interface path",
-				 dev_bdi->dbcc_name);
-		return ret;
-	}
-
-	hotplug_path = sanitize_path(dev_bdi->dbcc_name);
-	if (hotplug_path == NULL) {
-		usbi_err(NULL, "could not sanitize", dev_bdi->dbcc_name);
-		return ret;
-	}
 
 	online = (wParam == DBT_DEVICEARRIVAL);
 
 	usbi_mutex_static_lock(&active_contexts_lock);
 	list_for_each_entry( ctx, &active_contexts_list, list,
 			     struct libusb_context){
-		dev = get_hotplug_device_node(dev_bdi, ctx,
+
+		dev = get_hotplug_device_node(dev_bdi->dbcc_name, ctx,
 					      (wParam == DBT_DEVICEARRIVAL));
+
 		if (!dev){
 			usbi_warn(ctx, "no new dev node ignoring");
 			continue;
@@ -1201,8 +1181,7 @@ LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
 	}
 	usbi_mutex_static_unlock(&active_contexts_lock);
 
-	safe_free(hotplug_path);
-	return ret;
+	return TRUE;
 }
 
 /*
