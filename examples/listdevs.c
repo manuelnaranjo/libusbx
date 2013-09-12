@@ -59,6 +59,8 @@ int main(void)
 	if (r < 0)
 		return r;
 
+	libusb_set_debug(NULL, 4);
+
 	cnt = libusb_get_device_list(NULL, &devs);
 	if (cnt < 0)
 		return (int) cnt;
