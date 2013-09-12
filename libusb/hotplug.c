@@ -48,7 +48,7 @@
  * Version 1.0.16, \ref LIBUSBX_API_VERSION >= 0x01000102, has added support
  * for hotplug events on <b>some</b> platforms (you should test if your platform
  * supports hotplug notification by calling \ref libusb_has_capability() with
- * parameter \ref LIBUSB_CAP_HAS_HOTPLUG). 
+ * parameter \ref LIBUSB_CAP_HAS_HOTPLUG).
  *
  * This interface allows you to request notification for the arrival and departure
  * of matching USB devices.
@@ -146,31 +146,41 @@ static int usbi_hotplug_match_cb (struct libusb_context *ctx,
 	struct libusb_device *dev, libusb_hotplug_event event,
 	struct libusb_hotplug_callback *hotplug_cb)
 {
+	usbi_dbg("usbi_hotplug_match_cb vid: 0x%04X pid: 0x%04X event: %i",
+		 dev->device_descriptor.idVendor,
+		 dev->device_descriptor.idProduct,
+		 event);
 	/* Handle lazy deregistration of callback */
 	if (hotplug_cb->needs_free) {
+		usbi_dbg("callback needs free");
 		/* Free callback */
 		return 1;
 	}
 
 	if (!(hotplug_cb->events & event)) {
+		usbi_dbg("hotplug_cb event doesn't match event");
 		return 0;
 	}
 
 	if (LIBUSB_HOTPLUG_MATCH_ANY != hotplug_cb->vendor_id &&
 	    hotplug_cb->vendor_id != dev->device_descriptor.idVendor) {
+		usbi_dbg("no match of vid");
 		return 0;
 	}
 
 	if (LIBUSB_HOTPLUG_MATCH_ANY != hotplug_cb->product_id &&
 	    hotplug_cb->product_id != dev->device_descriptor.idProduct) {
+		usbi_dbg("no match of pid");
 		return 0;
 	}
 
 	if (LIBUSB_HOTPLUG_MATCH_ANY != hotplug_cb->dev_class &&
 	    hotplug_cb->dev_class != dev->device_descriptor.bDeviceClass) {
+		usbi_dbg("no match of class");
 		return 0;
 	}
 
+	usbi_dbg("there's a match");
 	return hotplug_cb->cb (ctx, dev, event, hotplug_cb->user_data);
 }
 
