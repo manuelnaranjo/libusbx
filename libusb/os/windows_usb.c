@@ -22,7 +22,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <config.h>
+#include "config.h"
 #include <windows.h>
 #include <setupapi.h>
 #include <ctype.h>
@@ -44,11 +44,44 @@
 #define LOOP_BREAK(err) { r=err; continue; }
 
 // Helper prototypes
-static int windows_get_active_config_descriptor(struct libusb_device *dev, unsigned char *buffer, size_t len, int *host_endian);
-static int windows_clock_gettime(int clk_id, struct timespec *tp);
+static int windows_get_active_config_descriptor(struct libusb_device *dev,
+                                                unsigned char *buffer,
+                                                size_t len,
+                                                int *host_endian);
+static int windows_clock_gettime(int clk_id,
+                                 struct timespec *tp);
 unsigned __stdcall windows_clock_gettime_threaded(void* param);
 // Common calls
-static int common_configure_endpoints(int sub_api, struct libusb_device_handle *dev_handle, int iface);
+static int common_configure_endpoints(int sub_api,
+                                      struct libusb_device_handle *dev_handle,
+                                      int iface);
+static void get_api_type(struct libusb_context *ctx,
+                         HDEVINFO *dev_info,
+                         SP_DEVINFO_DATA *dev_info_data,
+                         int *api,
+                         int *sub_api);
+static int set_composite_interface(struct libusb_context* ctx,
+                                   struct libusb_device* dev,
+                                   char* dev_interface_path,
+                                   char* device_id,
+                                   int api,
+                                   int sub_api);
+static int set_hid_interface(struct libusb_context* ctx,
+                             struct libusb_device* dev,
+                             char* dev_interface_path);
+static int init_device(struct libusb_device* dev,
+                       struct libusb_device* parent_dev,
+                       uint8_t port_number,
+                       char* device_id,
+                       DWORD devinst);
+
+static int initialize_device(struct libusb_context* ctx,
+                             char * dev_path);
+
+// hotplug related methods
+void windows_hotplug_poll_internal_master(int);
+void windows_hotplug_poll_internal();
+unsigned __stdcall windows_hotplug_threaded(void* param);
 
 // WinUSB-like API prototypes
 static int winusbx_init(int sub_api, struct libusb_context *ctx);
@@ -113,11 +146,18 @@ struct timespec timer_tp;
 volatile LONG request_count[2] = {0, 1};	// last one must be > 0
 HANDLE timer_request[2] = { NULL, NULL };
 HANDLE timer_response = NULL;
-// Hotplub thread
+
+// Hotplug thread
 HANDLE hotplug_thread = NULL;
+HWND hHotplugMessage;
+
 // API globals
-#define CHECK_WINUSBX_AVAILABLE(sub_api) do { if (sub_api == SUB_API_NOTSET) sub_api = priv->sub_api; \
-	if (!WinUSBX[sub_api].initialized) return LIBUSB_ERROR_ACCESS; } while(0)
+#define CHECK_WINUSBX_AVAILABLE(sub_api) \
+	do {																\
+		if (sub_api == SUB_API_NOTSET) sub_api = priv->sub_api;			\
+		if (!WinUSBX[sub_api].initialized) return LIBUSB_ERROR_ACCESS;	\
+	} while(0)
+
 static struct winusb_interface WinUSBX[SUB_API_MAX];
 const char* sub_api_name[SUB_API_MAX] = WINUSBX_DRV_NAMES;
 bool api_hid_available = false;
@@ -224,6 +264,29 @@ static char* sanitize_path(const char* path)
 	return ret_path;
 }
 
+static inline void windows_device_priv_init(libusb_device* dev) {
+	struct windows_device_priv* p = _device_priv(dev);
+	int i;
+	p->depth = 0;
+	p->port = 0;
+	p->path = NULL;
+	p->apib = &usb_api_backend[USB_API_UNSUPPORTED];
+	p->sub_api = SUB_API_NOTSET;
+	p->hid = NULL;
+	p->active_config = 0;
+	p->config_descriptor = NULL;
+	memset(&(p->dev_descriptor), 0, sizeof(USB_DEVICE_DESCRIPTOR));
+	for (i=0; i<USB_MAXINTERFACES; i++) {
+		p->usb_interface[i].path = NULL;
+		p->usb_interface[i].apib = &usb_api_backend[USB_API_UNSUPPORTED];
+		p->usb_interface[i].sub_api = SUB_API_NOTSET;
+		p->usb_interface[i].nb_endpoints = 0;
+		p->usb_interface[i].endpoint = NULL;
+		p->usb_interface[i].restricted_functionality = false;
+	}
+}
+
+
 /*
  * Cfgmgr32, OLE32 and SetupAPI DLL functions
  */
@@ -233,9 +296,11 @@ static int init_dlls(void)
 	DLL_LOAD(Cfgmgr32.dll, CM_Get_Child, TRUE);
 	DLL_LOAD(Cfgmgr32.dll, CM_Get_Sibling, TRUE);
 	DLL_LOAD(Cfgmgr32.dll, CM_Get_Device_IDA, TRUE);
+
 	// Prefixed to avoid conflict with header files
 	DLL_LOAD_PREFIXED(OLE32.dll, p, CLSIDFromString, TRUE);
 	DLL_LOAD_PREFIXED(SetupAPI.dll, p, SetupDiGetClassDevsA, TRUE);
+	DLL_LOAD_PREFIXED(SetupAPI.dll, p, SetupDiGetClassDevsExA, TRUE);
 	DLL_LOAD_PREFIXED(SetupAPI.dll, p, SetupDiEnumDeviceInfo, TRUE);
 	DLL_LOAD_PREFIXED(SetupAPI.dll, p, SetupDiEnumDeviceInterfaces, TRUE);
 	DLL_LOAD_PREFIXED(SetupAPI.dll, p, SetupDiGetDeviceInterfaceDetailA, TRUE);
@@ -305,19 +370,22 @@ static SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details(struct libusb_co
 	DWORD size;
 
 	if (_index <= 0) {
-		*dev_info = pSetupDiGetClassDevsA(guid, NULL, NULL, DIGCF_PRESENT|DIGCF_DEVICEINTERFACE);
+		*dev_info = pSetupDiGetClassDevsA(guid,
+										  NULL,
+										  NULL,
+										  DIGCF_PRESENT|DIGCF_DEVICEINTERFACE);
 	}
 
-        if (dev_info == INVALID_HANDLE_VALUE) {
-            return NULL;
-        }
+	if (dev_info == INVALID_HANDLE_VALUE) {
+		return NULL;
+	}
 
 	if (dev_info_data != NULL) {
 		dev_info_data->cbSize = sizeof(SP_DEVINFO_DATA);
 		if (!pSetupDiEnumDeviceInfo(*dev_info, _index, dev_info_data)) {
 			if (GetLastError() != ERROR_NO_MORE_ITEMS) {
 				usbi_err(ctx, "Could not obtain device info data for index %u: %s",
-					_index, windows_error_str(0));
+						 _index, windows_error_str(0));
 			}
 			pSetupDiDestroyDeviceInfoList(*dev_info);
 			*dev_info = INVALID_HANDLE_VALUE;
@@ -329,7 +397,7 @@ static SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details(struct libusb_co
 	if (!pSetupDiEnumDeviceInterfaces(*dev_info, NULL, guid, _index, &dev_interface_data)) {
 		if (GetLastError() != ERROR_NO_MORE_ITEMS) {
 			usbi_err(ctx, "Could not obtain interface data for index %u: %s",
-				_index, windows_error_str(0));
+					 _index, windows_error_str(0));
 		}
 		pSetupDiDestroyDeviceInfoList(*dev_info);
 		*dev_info = INVALID_HANDLE_VALUE;
@@ -337,11 +405,16 @@ static SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details(struct libusb_co
 	}
 
 	// Read interface data (dummy + actual) to access the device path
-	if (!pSetupDiGetDeviceInterfaceDetailA(*dev_info, &dev_interface_data, NULL, 0, &size, NULL)) {
+	if (!pSetupDiGetDeviceInterfaceDetailA(*dev_info,
+										   &dev_interface_data,
+										   NULL,
+										   0,
+										   &size,
+										   NULL)) {
 		// The dummy call should fail with ERROR_INSUFFICIENT_BUFFER
 		if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
 			usbi_err(ctx, "could not access interface data (dummy) for index %u: %s",
-				_index, windows_error_str(0));
+					 _index, windows_error_str(0));
 			goto err_exit;
 		}
 	} else {
@@ -349,21 +422,22 @@ static SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details(struct libusb_co
 		goto err_exit;
 	}
 
-	if ((dev_interface_details = (SP_DEVICE_INTERFACE_DETAIL_DATA_A*) calloc(size, 1)) == NULL) {
+	dev_interface_details = (SP_DEVICE_INTERFACE_DETAIL_DATA_A*) calloc(size, 1);
+	if (dev_interface_details == NULL) {
 		usbi_err(ctx, "could not allocate interface data for index %u.", _index);
 		goto err_exit;
 	}
 
 	dev_interface_details->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
 	if (!pSetupDiGetDeviceInterfaceDetailA(*dev_info, &dev_interface_data,
-		dev_interface_details, size, &size, NULL)) {
+										   dev_interface_details, size, &size, NULL)) {
 		usbi_err(ctx, "could not access interface data (actual) for index %u: %s",
-			_index, windows_error_str(0));
+				 _index, windows_error_str(0));
 	}
 
 	return dev_interface_details;
 
-err_exit:
+  err_exit:
 	pSetupDiDestroyDeviceInfoList(*dev_info);
 	*dev_info = INVALID_HANDLE_VALUE;
 	return NULL;
@@ -512,18 +586,23 @@ static int htab_create(struct libusb_context *ctx, unsigned long nel)
 /* After using the hash table it has to be destroyed.  */
 static void htab_destroy(void)
 {
+	usbi_dbg("");
 	size_t i;
 	if (htab_table == NULL) {
+		usbi_dbg("no table");
 		return;
 	}
 
 	for (i=0; i<htab_size; i++) {
-		if (htab_table[i].used) {
+		if (htab_table[i].used && htab_table[i].str != NULL) {
 			safe_free(htab_table[i].str);
 		}
 	}
+
 	usbi_mutex_destroy(&htab_write_mutex);
+
 	safe_free(htab_table);
+	usbi_dbg("done");
 }
 
 /* This is the search function. It uses double hashing with open addressing.
@@ -608,13 +687,14 @@ static unsigned long htab_hash(char* str)
 	// string (same hash, different string) at the same time is extremely low
 	safe_free(htab_table[idx].str);
 	htab_table[idx].used = hval;
-	htab_table[idx].str = (char*) malloc(safe_strlen(str)+1);
+	htab_table[idx].str = (char*) calloc(safe_strlen(str)+1, sizeof(char));
 	if (htab_table[idx].str == NULL) {
+		htab_table[idx].used = 0;
 		usbi_err(NULL, "could not duplicate string for hash table");
 		usbi_mutex_unlock(&htab_write_mutex);
 		return 0;
 	}
-	memcpy(htab_table[idx].str, str, safe_strlen(str)+1);
+	memcpy(htab_table[idx].str, str, safe_strlen(str));
 	++htab_filled;
 	usbi_mutex_unlock(&htab_write_mutex);
 
@@ -797,188 +877,731 @@ static void auto_release(struct usbi_transfer *itransfer)
 	usbi_mutex_unlock(&autoclaim_lock);
 }
 
-LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
-                                                       UINT message,
-                                                       WPARAM wParam,
-                                                       LPARAM lParam,
-                                                       struct libusb_context* ctx)
+
+/**
+ * initialize_device:
+ * Initializes basic structures for the given device uuid path.
+ *
+ */
+static int initialize_device(struct libusb_context* ctx,
+                             char * dev_path)
 {
-    LRESULT ret = TRUE;
-    DEV_BROADCAST_HDR* dev_bhd;
-    DEV_BROADCAST_DEVICEINTERFACE* dev_bdi;
-    libusb_device **devs;
-    struct libusb_device *dev;
-    struct windows_device_priv *priv;
-    char* hotplug_path;
-    bool online;
-    ssize_t i;
-    unsigned long session_id;
+	unsigned long session_id;
+	SP_DEVINFO_DATA dev_info_data = { 0 };
+	SP_DEVICE_INTERFACE_DETAIL_DATA_A *dev_interface_details = NULL;
+	HDEVINFO dev_info = { 0 };
 
-    if (wParam != DBT_DEVICEARRIVAL && wParam != DBT_DEVICEREMOVECOMPLETE) {
-        return ret;
-    }
+	session_id = htab_hash(dev_path);
 
-    dev_bhd = (DEV_BROADCAST_HDR*)lParam;
-    if (dev_bhd->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE ) {
-        return ret;
-    }
+	dev_info = pSetupDiGetClassDevsExA(
+		NULL, // ClassGuid
+		dev_path, // Enumerator
+		NULL, // hwndParent
+		DIGCF_DEVICEINTERFACE | DIGCF_ALLCLASSES | DIGCF_PRESENT, // flags
+		NULL, // DeviceInfoSet
+		NULL, // MachineName
+		NULL // reserved
+		);
 
-    dev_bdi = (DEV_BROADCAST_DEVICEINTERFACE*)dev_bhd;
-    // We assert that a device interface path is just a device id plus a GUID
-    for (i = safe_strlen(dev_bdi->dbcc_name)-38; i >= 0; ) {
-        // GUID is 38 chars
-        if (dev_bdi->dbcc_name[i--] == '{' && dev_bdi->dbcc_name[i--] == '#')
-            {
-                dev_bdi->dbcc_name[++i] = 0;
-                break;
-            }
-    }
+	if (dev_info == INVALID_HANDLE_VALUE){
+		usbi_err(ctx,
+				 "SetupDiGetClassDevsEx failed for %s: %s",
+				 dev_path, windows_error_str(0));
 
-    if (i < 0) {
-        usbi_err(ctx, "%s is not a device interface path",
-                 dev_bdi->dbcc_name);
-        return ret;
-    }
+		return LIBUSB_ERROR_OTHER;
+	}
 
-    hotplug_path = sanitize_path(dev_bdi->dbcc_name);
-    if (hotplug_path == NULL) {
-        usbi_err(ctx, "could not sanitize", dev_bdi->dbcc_name);
-        return ret;
-    }
-    session_id = htab_hash(hotplug_path);
-    safe_free(hotplug_path);
+	return LIBUSB_SUCCESS;
+}
 
-    online = (wParam == DBT_DEVICEARRIVAL);
-    if (online) {
-        // If it's an insertion, update the list
-        libusb_get_device_list(ctx, &devs);
-    }
 
-    dev = usbi_get_device_by_session_id(ctx, session_id);
-    if (dev == NULL) {
-        usbi_warn(ctx, "%s %ld(not active)",
-                  (online)?"INSERTION":"REMOVAL",
-                  session_id);
-        return ret;
-    }
+LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
+													   UINT message,
+													   WPARAM wParam,
+													   LPARAM lParam)
+{
+	LRESULT ret = TRUE;
+	DEV_BROADCAST_HDR* dev_bhd;
+	DEV_BROADCAST_DEVICEINTERFACE* dev_bdi;
+	libusb_device **devs;
+	struct libusb_device *dev;
+	struct windows_device_priv *priv;
+	struct libusb_context *ctx;
+	char* hotplug_path;
+	bool online;
+	ssize_t i;
+	unsigned long session_id;
 
-    priv = _device_priv(dev);
-    usbi_warn(ctx,
-              "(bus: %d, addr: %d, depth: %d, port: %d, state: %s)",
-              dev->bus_number,
-              dev->device_address,
-              priv->depth,
-              priv->port,
-              online?"INSERTION":"REMOVAL"
-        );
+	if (wParam != DBT_DEVICEARRIVAL && wParam != DBT_DEVICEREMOVECOMPLETE) {
+		return ret;
+	}
 
-    if (online)
-        usbi_connect_device(dev);
-    else
-        usbi_disconnect_device(dev);
+	dev_bhd = (DEV_BROADCAST_HDR*)lParam;
+	usbi_err(NULL, "dbt_arrival %i", dev_bhd->dbch_devicetype);
+	if (dev_bhd->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE ) {
+		return ret;
+	}
+
+	dev_bdi = (DEV_BROADCAST_DEVICEINTERFACE*)dev_bhd;
+	// We assert that a device interface path is just a device id plus a GUID
+	for (i = safe_strlen(dev_bdi->dbcc_name)-38; i >= 0; ) {
+		// GUID is 38 chars
+		if (dev_bdi->dbcc_name[i--] == '{' && dev_bdi->dbcc_name[i--] == '#'){
+			dev_bdi->dbcc_name[++i] = 0;
+			break;
+		}
+	}
+
+	if (i < 0) {
+		usbi_err(NULL, "%s is not a device interface path",
+				 dev_bdi->dbcc_name);
+		return ret;
+	}
+
+	hotplug_path = sanitize_path(dev_bdi->dbcc_name);
+	if (hotplug_path == NULL) {
+		usbi_err(NULL, "could not sanitize", dev_bdi->dbcc_name);
+		return ret;
+	}
+
+	session_id = htab_hash(hotplug_path);
+
+	online = (wParam == DBT_DEVICEARRIVAL);
+
+	usbi_mutex_static_lock(&active_contexts_lock);
+	list_for_each_entry( ctx, &active_contexts_list, list,
+			     struct libusb_context){
+
+		if (online && usbi_get_device_by_session_id(ctx, session_id)){
+			usbi_dbg("session id %ld all ready exists on connectx",
+				 session_id);
+			continue;
+		}
+		if (!online && !usbi_get_device_by_session_id(ctx, session_id)){
+			usbi_dbg("device not known for %ld on disconnect",
+				 session_id);
+			continue;
+		}
+		if (online) {
+			// force enumeration again
+			windows_hotplug_poll_internal(ctx, 0);
+		}
+
+		usbi_dbg("usbi_get_device_by_session_id1");
+		dev = usbi_get_device_by_session_id(ctx, session_id);
+		if (dev == NULL) {
+			usbi_err(NULL, "device not known in this session");
+			continue;
+		}
+		usbi_dbg("usbi_get_device_by_session_id1 return");
+
+		priv = _device_priv(dev);
+		usbi_err(NULL,
+				 "(bus: %d, addr: %d, prod: %04X:%04X, state: %s)",
+				 dev->bus_number,
+				 dev->device_address,
+				 dev->device_descriptor.idVendor,
+				 dev->device_descriptor.idProduct,
+				 online?"INSERTION":"REMOVAL"
+			);
+
+		if (online)
+			usbi_connect_device(dev);
+		else
+			usbi_disconnect_device(dev);
+	}
+	usbi_mutex_static_unlock(&active_contexts_lock);
+
+	safe_free(hotplug_path);
+	return ret;
 }
 
 /*
  * Hotplug messaging callback
  */
 // TODO: Windows limitations mean we cannot detect driverless devices with this
-//       => add another more generic callback for driverless, and check against
-//          this one?
+//		 => add another more generic callback for driverless, and check against
+//			this one?
 LRESULT CALLBACK messaging_callback(HWND hWnd,
-                                    UINT message,
-                                    WPARAM wParam,
-                                    LPARAM lParam)
+				    UINT message,
+				    WPARAM wParam,
+				    LPARAM lParam)
 {
-    static struct libusb_context* ctx;
-    LRESULT ret = TRUE;
+	LRESULT ret = TRUE;
 
-    switch (message) {
-    case WM_CREATE:
-        ctx = (libusb_context*)((CREATESTRUCT*)lParam)->lpCreateParams;
-        break;
-    case WM_DEVICECHANGE:
-        ret = message_callback_handle_device_change(hWnd,
-                                                    message,
-                                                    wParam,
-                                                    lParam,
-                                                    ctx);
-        break;
-    default:
-        ret = DefWindowProc(hWnd, message, wParam, lParam);
-        break;
-    }
-    return ret;
+	switch (message) {
+	case WM_DEVICECHANGE:
+		ret = message_callback_handle_device_change(hWnd,
+							    message,
+							    wParam,
+							    lParam);
+		break;
+	default:
+		ret = DefWindowProc(hWnd, message, wParam, lParam);
+		break;
+	}
+	return ret;
 }
 
 unsigned __stdcall windows_hotplug_threaded(void* param)
 {
-    MSG msg;
-    WNDCLASSEX wc;
-    DEV_BROADCAST_DEVICEINTERFACE dev_bdi;
-    HWND hMessage;
-    struct libusb_context* ctx = (struct libusb_context *)param;
-    BOOL r;
+	MSG msg;
+	WNDCLASSEX wc;
+	DEV_BROADCAST_DEVICEINTERFACE dev_bdi;
+	struct libusb_context *ctx = (struct libusb_context*) param;
+	BOOL r;
+	HDEVNOTIFY res;
 
-    memset(&wc, 0, sizeof(wc));
-    wc.cbSize = sizeof(WNDCLASSEX);
-    wc.style = CS_DBLCLKS | CS_SAVEBITS;
-    wc.lpfnWndProc = messaging_callback;
-    wc.lpszClassName = "libusb_messaging_class";
+	memset(&wc, 0, sizeof(WNDCLASSEX));
+	wc.cbSize = sizeof(WNDCLASSEX);
+	wc.style = CS_DBLCLKS | CS_SAVEBITS;
+	wc.lpfnWndProc = messaging_callback;
+	wc.lpszClassName = "libusb_messaging_class";
 
-    if (!RegisterClassExA(&wc)) {
-        usbi_err(ctx, "can't register class %s", windows_error_str(0));
-        return LIBUSB_ERROR_ACCESS;
-    }
+	if (!RegisterClassExA(&wc)) {
+		usbi_err(ctx, "can't register class %s", windows_error_str(0));
+		return LIBUSB_ERROR_ACCESS;
+	}
 
-    hMessage = CreateWindowExA(
-        WS_EX_TOPMOST,
-        "libusb_messaging_class",
-        "libusb_messaging",
-        0, 100, 100, 287, 102,
-        // Note: Using HWND_MESSAGE removes broadcast events, like the ones from
-        // driverless devices. However the broadcast events you get on driverless
-        // provide no data whatsoever about the device, the event (insertion or
-        // removal), or even if the device is actually USB. Bummer!
-        HWND_MESSAGE, NULL, NULL, ctx);
-    if (hMessage == NULL) {
-        usbi_err(ctx,
-                 "Unable to create progress dialog: %s", windows_error_str(0));
-        return LIBUSB_ERROR_ACCESS;
-    }
+	hHotplugMessage = CreateWindowExA(
+		WS_EX_TOPMOST,
+		"libusb_messaging_class",
+		"libusb_messaging",
+		0, 100, 100, 287, 102,
+		// Note: Using HWND_MESSAGE removes broadcast events, like
+		// the ones from driverless devices. However the broadcast
+		// events you get on driverless provide no data whatsoever
+		// about the device, the event (insertion or removal), or
+		// even if the device is actually USB. Bummer!
+		HWND_MESSAGE, NULL, NULL, NULL);
+	if (hHotplugMessage == NULL) {
+		usbi_err(ctx,
+			 "Unable to create progress dialog: %s",
+			 windows_error_str(0));
+		return LIBUSB_ERROR_ACCESS;
+	}
 
-    memset(&dev_bdi, 0, sizeof(dev_bdi));
-    dev_bdi.dbcc_size = sizeof(DEV_BROADCAST_DEVICEINTERFACE);
-    dev_bdi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
-    dev_bdi.dbcc_classguid = GUID_DEVINTERFACE_USB_DEVICE; //GUID_DEVCLASS_WCEUSBS;
+	memset(&dev_bdi, 0, sizeof(DEV_BROADCAST_DEVICEINTERFACE));
+	dev_bdi.dbcc_size = sizeof(DEV_BROADCAST_DEVICEINTERFACE);
+	dev_bdi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+	dev_bdi.dbcc_classguid = GUID_DEVINTERFACE_USB_DEVICE;
+	//GUID_DEVCLASS_WCEUSBS;
 
-    if (RegisterDeviceNotification(hMessage,
-                                   &dev_bdi,
-                                   DEVICE_NOTIFY_WINDOW_HANDLE) == NULL ) {
-        return LIBUSB_ERROR_ACCESS;
-    }
+	// TODO: When running with Dr Memory this call reports unitialized read
+	res = RegisterDeviceNotificationA(hHotplugMessage,
+					  &dev_bdi,
+					  DEVICE_NOTIFY_WINDOW_HANDLE);
+	if ( NULL == res ) {
+		return LIBUSB_ERROR_ACCESS;
+	}
 
-    // We need to handle the message pump
-    while( (r = GetMessage(&msg, NULL, 0, 0)) != 0) {
-        if (r == -1) {
-            usbi_err(ctx, "GetMessage error");
-        } else {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-    }
+	usbi_info(ctx, "hotplug waiting for messages");
 
-    usbi_dbg("terminating thread");
+	// We need to handle the message pump
+	while( (r = GetMessage(&msg, NULL, 0, 0)) != 0) {
+		usbi_dbg("got message");
+		if (r == -1) {
+			usbi_err(ctx, "GetMessage error");
+		} else {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+	}
 
-    return LIBUSB_SUCCESS;
+	if (hHotplugMessage != NULL)
+		UnregisterDeviceNotification(res);
+
+	usbi_dbg("terminating thread");
+
+	return LIBUSB_SUCCESS;
 }
 
+void windows_hotplug_poll_internal(struct libusb_context *ctx, int event){
+	HDEVINFO dev_info = { 0 };
+	const char* usb_class[] = {"USB", "NUSB3", "IUSB3"};
+	SP_DEVINFO_DATA dev_info_data = { 0 };
+	SP_DEVICE_INTERFACE_DETAIL_DATA_A *dev_interface_details = NULL;
+	GUID hid_guid;
+	GUID* guid[MAX_ENUM_GUIDS];
+	int r = LIBUSB_SUCCESS;
+	int api, sub_api;
+	size_t class_index = 0;
+	unsigned int nb_guids, pass, i, j, ancestor;
+	char path[MAX_PATH_LENGTH];
+	char strbuf[MAX_PATH_LENGTH];
+	struct libusb_device *dev, *parent_dev, *tdev;
+	struct windows_device_priv *priv, *parent_priv;
+	char* dev_interface_path = NULL;
+	char* dev_id_path = NULL;
+	unsigned long session_id;
+	DWORD size, reg_type, port_nr, install_state;
+	HKEY key;
+	WCHAR guid_string_w[MAX_GUID_STRING_LENGTH];
+	GUID* if_guid;
+	LONG s;
+	int res;
 
-static int windows_get_device_list(struct libusb_context *ctx, struct discovered_devs **_discdevs);
+	// keep a list of all discovered devices so garbage devices can be correctly
+	// unreferenced
+	libusb_device** unref_list;
+	unsigned int unref_size = 64;
+	unsigned int unref_cur = 0;
+
+	// PASS 1 : (re)enumerate HCDs (allows for HCD hotplug)
+	// PASS 2 : (re)enumerate HUBS
+	// PASS 3 : (re)enumerate generic USB devices (including driverless)
+	//          and list additional USB device interface GUIDs to explore
+	// PASS 4 : (re)enumerate master USB devices that have a device interface
+	// PASS 5+: (re)enumerate device interfaced GUIDs (including HID) and
+	//          set the device interfaces.
+
+	// Init the GUID table
+	guid[HCD_PASS] = &GUID_DEVINTERFACE_USB_HOST_CONTROLLER;
+	guid[HUB_PASS] = &GUID_DEVINTERFACE_USB_HUB;
+	guid[GEN_PASS] = NULL;
+	guid[DEV_PASS] = &GUID_DEVINTERFACE_USB_DEVICE;
+	HidD_GetHidGuid(&hid_guid);
+	guid[HID_PASS] = &hid_guid;
+	nb_guids = HID_PASS+1;
+
+	unref_list = (libusb_device**) calloc(unref_size, sizeof(libusb_device*));
+	if (unref_list == NULL) {
+		usbi_err(ctx,
+			 "Out of memory while trying to alloc unref_list");
+		return;
+	}
+
+	for (pass = 0; ((pass < nb_guids) && (r == LIBUSB_SUCCESS)); pass++) {
+#define ENUM_DEBUG
+#ifdef ENUM_DEBUG
+		const char *passname[] = { "HCD", "HUB", "GEN", "DEV", "HID", "EXT" };
+		usbi_dbg("\n#### PROCESSING %ss %s",
+			 passname[(pass<=HID_PASS)?pass:HID_PASS+1],
+			 (pass!=GEN_PASS)?guid_to_string(guid[pass]):"");
+#endif
+		for (i = 0; ; i++) {
+			// safe loop: free up any (unprotected) dynamic resource
+			// NB: this is always executed before breaking the loop
+			safe_free(dev_interface_details);
+			safe_free(dev_interface_path);
+			safe_free(dev_id_path);
+			priv = parent_priv = NULL;
+			dev = parent_dev = NULL;
+
+			// Safe loop: end of loop conditions
+			if (r != LIBUSB_SUCCESS) {
+				break;
+			}
+			if ((pass == HCD_PASS) && (i == UINT8_MAX)) {
+				usbi_warn(ctx,
+					  "program assertion failed - found more than %d buses"
+					  ", skipping the rest.", UINT8_MAX);
+				break;
+			}
+			if (pass != GEN_PASS) {
+				// Except for GEN, all passes deal with device interfaces
+				dev_interface_details = \
+					get_interface_details(ctx,
+							      &dev_info,
+							      &dev_info_data,
+							      guid[pass],
+							      i);
+				if (dev_interface_details == NULL) {
+					break;
+				}
+				dev_interface_path = sanitize_path(
+					dev_interface_details->DevicePath);
+				if (dev_interface_path == NULL) {
+					continue;
+				}
+			} else {
+				// Workaround for a Nec/Renesas USB 3.0 driver bug where root hubs are
+				// being listed under the "NUSB3" PnP Symbolic Name rather than "USB".
+				// The Intel USB 3.0 driver behaves similar, but uses "IUSB3"
+				for (; class_index < ARRAYSIZE(usb_class); class_index++) {
+					if (get_devinfo_data(ctx,
+										 &dev_info,
+										 &dev_info_data,
+										 usb_class[class_index],
+										 i))
+						break;
+					i = 0;
+				}
+				if (class_index >= ARRAYSIZE(usb_class))
+					break;
+			}
+
+			// Read the Device ID path. This is what we'll use as UID
+			// Note that if the device is plugged in a different port or hub, the Device ID changes
+			if (CM_Get_Device_IDA(dev_info_data.DevInst,
+								  path,
+								  sizeof(path), 0) != CR_SUCCESS)
+				{
+					usbi_warn(NULL,
+							  "could not read the devid path for devinst %X, skipping",
+							  dev_info_data.DevInst);
+					continue;
+				}
+			dev_id_path = sanitize_path(path);
+			if (dev_id_path == NULL) {
+				usbi_warn(NULL,
+						  "could not sanitize devid path for devinst %X, skipping",
+						  dev_info_data.DevInst);
+				continue;
+			}
+
+#ifdef ENUM_DEBUG
+			usbi_dbg("PRO: %s", dev_id_path);
+#endif
+
+			// The SPDRP_ADDRESS for USB devices is the device port number on the hub
+			port_nr = 0;
+			if ((pass >= HUB_PASS) && (pass <= GEN_PASS)) {
+				if ( (!pSetupDiGetDeviceRegistryPropertyA(
+						  dev_info,
+						  &dev_info_data,
+						  SPDRP_ADDRESS,
+						  &reg_type,
+						  (BYTE*)&port_nr,
+						  4,
+						  &size)) || (size != 4) ) {
+					usbi_warn(NULL,
+							  "could not retrieve port number for device '%s'"
+							  ", skipping: %s",
+							  dev_id_path, windows_error_str(0));
+					continue;
+				}
+			}
+
+			usbi_dbg("port number: %i", port_nr);
+			// Set API to use or get additional data from generic pass
+			api = USB_API_UNSUPPORTED;
+			sub_api = SUB_API_NOTSET;
+			switch (pass) {
+			case HCD_PASS:
+				break;
+			case GEN_PASS:
+				// We use the GEN pass to detect driverless devices...
+				size = sizeof(strbuf);
+				if (!pSetupDiGetDeviceRegistryPropertyA(dev_info,
+														&dev_info_data,
+														SPDRP_DRIVER,
+														&reg_type,
+														(BYTE*)strbuf,
+														size,
+														&size)) {
+					usbi_info(NULL, "The following device has no driver: '%s'",
+							  dev_id_path);
+					usbi_info(NULL, "libusbx will not be able to access it.");
+				}
+				// ...and to add the additional device interface GUIDs
+				key = pSetupDiOpenDevRegKey(dev_info,
+											&dev_info_data,
+											DICS_FLAG_GLOBAL,
+											0,
+											DIREG_DEV,
+											KEY_READ);
+				if (key != INVALID_HANDLE_VALUE) {
+					size = sizeof(guid_string_w);
+					s = pRegQueryValueExW(key,
+										  L"DeviceInterfaceGUIDs",
+										  NULL,
+										  &reg_type,
+										  (BYTE*)guid_string_w,
+										  &size);
+					pRegCloseKey(key);
+					if (s == ERROR_SUCCESS) {
+						if (nb_guids >= MAX_ENUM_GUIDS) {
+							//If this assert is ever reported, grow a GUID
+							//table dynamically
+							usbi_err(NULL,
+									 "program assertion failed: too many "
+									 "GUIDs");
+							LOOP_BREAK(LIBUSB_ERROR_OVERFLOW);
+						}
+						if_guid = (GUID*) calloc(1, sizeof(GUID));
+						pCLSIDFromString(guid_string_w, if_guid);
+						guid[nb_guids++] = if_guid;
+						usbi_dbg("extra GUID: %s", guid_to_string(if_guid));
+					}
+				}
+				break;
+			case HID_PASS:
+				api = USB_API_HID;
+				break;
+			default:
+				// Get the API type (after checking that the driver
+				// installation is OK)
+				if ( (!pSetupDiGetDeviceRegistryPropertyA(dev_info,
+														  &dev_info_data,
+														  SPDRP_INSTALL_STATE,
+														  &reg_type,
+														  (BYTE*)&install_state,
+														  4,
+														  &size))
+					 || (size != 4) ){
+					usbi_warn(NULL,
+							  "could not detect installation state of driver"
+							  " for '%s': %s",
+							  dev_id_path, windows_error_str(0));
+				} else if (install_state != 0) {
+					usbi_warn(NULL,
+							  "driver for device '%s' is reporting an issue"
+							  " (code: %d) - skipping",
+							  dev_id_path, install_state);
+					continue;
+				}
+				get_api_type(ctx, &dev_info, &dev_info_data, &api, &sub_api);
+				break;
+			}
+
+			usbi_dbg("got api type");
+			// Find parent device (for the passes that need it)
+			switch (pass) {
+			case HCD_PASS:
+			case DEV_PASS:
+			case HUB_PASS:
+				break;
+			default:
+				// Go through the ancestors until we see a face we recognize
+				parent_dev = NULL;
+				usbi_dbg("looking for parent");
+				for (ancestor = 1; parent_dev == NULL; ancestor++) {
+					session_id = get_ancestor_session_id(dev_info_data.DevInst,
+														 ancestor);
+					if (session_id == 0) {
+						break;
+					}
+					parent_dev = usbi_get_device_by_session_id(ctx, session_id);
+				}
+				if (parent_dev == NULL) {
+					usbi_dbg("unlisted ancestor for '%s' (non USB HID, newly "
+							 "connected, etc.) - ignoring", dev_id_path);
+					continue;
+				}
+				parent_priv = _device_priv(parent_dev);
+				usbi_dbg("got parent_priv");
+				// virtual USB devices are also listed during GEN - don't process
+				// these yet
+				if ((pass == GEN_PASS) && (parent_priv->apib->id != USB_API_HUB)) {
+					usbi_dbg("continue");
+					continue;
+				}
+				break;
+			}
+
+			usbi_dbg("found parent");
+			// Create new or match existing device, using the (hashed) device_id
+			// as session id
+			if (pass <= DEV_PASS) {
+				// For subsequent passes, we'll lookup the parent
+				// These are the passes that create "new" devices
+				session_id = htab_hash(dev_id_path);
+				dev = usbi_get_device_by_session_id(ctx, session_id);
+				if (dev == NULL) {
+					if (pass == DEV_PASS) {
+						// This can occur if the OS only reports a newly plugged
+						// device after we started enum
+						usbi_warn(NULL,
+								  "'%s' was only detected in late pass"
+								  " (newly connected device?) - ignoring",
+								  dev_id_path);
+						continue;
+					}
+					usbi_dbg("allocating new device for session [%X] %s",
+							 session_id, dev_id_path);
+					dev = usbi_alloc_device(ctx, session_id);
+					if (dev == NULL) {
+						usbi_err(NULL, "usbi_alloc_device failed");
+						LOOP_BREAK(LIBUSB_ERROR_NO_MEM);
+					}
+
+					windows_device_priv_init(dev);
+					usbi_connect_device(dev);
+					dev->attached = 0;
+
+					// Keep track of devices that need unref
+					unref_list[unref_cur++] = dev;
+					if (unref_cur >= unref_size) {
+						unref_size += 64;
+						unref_list = usbi_reallocf(
+							unref_list,
+							unref_size*sizeof(libusb_device*));
+						if (unref_list == NULL) {
+							usbi_err(ctx, "could not realloc list for unref"
+									 " - aborting.");
+							LOOP_BREAK(LIBUSB_ERROR_NO_MEM);
+						}
+					}
+
+				} else {
+					usbi_dbg("found existing device for session [%X] (%d.%d)\n",
+							 session_id, dev->bus_number, dev->device_address);
+				}
+				priv = _device_priv(dev);
+			}
+
+			usbi_dbg("");
+			// Setup device
+			switch (pass) {
+			case HCD_PASS:
+				// bus 0 is reserved for disconnected
+				dev->bus_number = (uint8_t)(i + 1);
+				dev->device_address = 0;
+				dev->num_configurations = 0;
+				priv->apib = &usb_api_backend[USB_API_HUB];
+				priv->sub_api = SUB_API_NOTSET;
+				priv->depth = UINT8_MAX; // Overflow to 0 for HCD Hubs
+				priv->path = dev_interface_path;
+				dev_interface_path = NULL;
+				break;
+			case HUB_PASS:
+			case DEV_PASS:
+				// If the device has already been setup, don't do it again
+				if (priv->path != NULL){
+					break;
+				}
+
+				// Take care of API initialization
+				priv->path = dev_interface_path;
+				dev_interface_path = NULL;
+				priv->apib = &usb_api_backend[api];
+				priv->sub_api = sub_api;
+				switch(api) {
+				case USB_API_COMPOSITE:
+				case USB_API_HUB:
+					break;
+				case USB_API_HID:
+					priv->hid = calloc(1, sizeof(struct hid_device_priv));
+					if (priv->hid == NULL) {
+						LOOP_BREAK(LIBUSB_ERROR_NO_MEM);
+					}
+					priv->hid->nb_interfaces = 0;
+					break;
+				default:
+					// For other devices, the first interface is the same as
+					// the device
+					priv->usb_interface[0].path = (char*) calloc(
+						safe_strlen(priv->path)+1, 1);
+					if (priv->usb_interface[0].path != NULL) {
+						safe_strcpy(priv->usb_interface[0].path,
+								safe_strlen(priv->path)+1, priv->path);
+					} else {
+						usbi_warn(NULL,
+								  "could not duplicate interface path '%s'",
+								  priv->path);
+					}
+					// The following is needed if we want API calls to work for
+					// both simple and composite devices.
+					for(j=0; j<USB_MAXINTERFACES; j++) {
+						priv->usb_interface[j].apib = &usb_api_backend[api];
+					}
+					break;
+				}
+				break;
+			case GEN_PASS:
+				r = init_device(dev,
+						parent_dev,
+						(uint8_t)port_nr,
+						dev_id_path,
+						dev_info_data.DevInst);
+				if (r == LIBUSB_SUCCESS) {
+					//Tell lib we have a new device
+					r = usbi_sanitize_device(dev);
+					if (r != LIBUSB_SUCCESS){
+						continue;
+					}
+					dev->attached = 1;
+					tdev = dev;
+					while((parent_dev=tdev->parent_dev)!=NULL){
+						tdev = parent_dev;
+						tdev->attached = 1;
+					}
+				} else if (r == LIBUSB_ERROR_NO_DEVICE) {
+					// This can occur if the device was disconnected but Windows
+					// hasn't refreshed its enumeration yet - in that case, we
+					// ignore the device
+					r = LIBUSB_SUCCESS;
+				} else {
+					usbi_dbg("non handled %i\n", r);
+				}
+				break;
+			default: // HID_PASS and later
+				if (parent_priv->apib->id == USB_API_HID) {
+					usbi_dbg("setting HID interface for [%lX]:",
+							 parent_dev->session_data);
+					r = set_hid_interface(ctx, parent_dev, dev_interface_path);
+					if (r != LIBUSB_SUCCESS) {
+						LOOP_BREAK(r);
+					}
+					dev_interface_path = NULL;
+				} else if (parent_priv->apib->id == USB_API_COMPOSITE) {
+					usbi_dbg("setting composite interface for [%lX]:",
+							 parent_dev->session_data);
+					switch (set_composite_interface(ctx, parent_dev,
+													dev_interface_path,
+													dev_id_path,
+													api,
+													sub_api)) {
+					case LIBUSB_SUCCESS:
+						dev_interface_path = NULL;
+						break;
+					case LIBUSB_ERROR_ACCESS:
+						// interface has already been set => make sure
+						// dev_interface_path is freed then
+						break;
+					default:
+						LOOP_BREAK(r);
+						break;
+					}
+				}
+				break;
+			}
+			usbi_dbg("");
+		}
+	}
+
+	// Free any additional GUIDs
+	for (pass = HID_PASS+1; pass < nb_guids; pass++) {
+		safe_free(guid[pass]);
+	}
+
+	for (i = 0 ; i < unref_cur; i++ ){
+		dev = unref_list[i];
+		priv = _device_priv(dev);
+		if (dev->attached){
+			if (priv->depth == UINT8_MAX){
+				dev->attached = 0;
+			}
+			continue;
+		}
+		usbi_disconnect_device(dev);
+		while(dev->refcnt>1)
+			libusb_unref_device(dev);
+		safe_unref_device(dev);
+	}
+	safe_free(unref_list);
+
+	printf("\nunref_cur %i\n", unref_cur);
+
+	usbi_dbg("done");
+}
+
+void windows_hotplug_poll_internal_master(int event) {
+	struct libusb_context *ctx;
+
+	usbi_dbg("entry");
+	usbi_mutex_static_lock(&active_contexts_lock);
+	list_for_each_entry(ctx, &active_contexts_list, list, struct libusb_context) {
+		windows_hotplug_poll_internal(ctx, event);
+	}
+	usbi_dbg("unlock");
+	usbi_mutex_static_unlock(&active_contexts_lock);
+	usbi_dbg("finish");
+}
 
 void windows_hotplug_poll(void){
-    struct discovered_devs * devs = discovered_devs_alloc();
-    windows_get_device_list(NULL, &devs);
-    discovered_devs_free(devs);
+	windows_hotplug_poll_internal_master(1);
 }
 
 /*
@@ -995,24 +1618,30 @@ static int windows_init(struct libusb_context *ctx)
 	HANDLE semaphore;
 	char sem_name[11+1+8]; // strlen(libusb_init)+'\0'+(32-bit hex PID)
 
-	sprintf(sem_name, "libusb_init%08X", (unsigned int)GetCurrentProcessId()&0xFFFFFFFF);
+	sprintf(sem_name,
+		"libusb_init%08X",
+		(unsigned int)GetCurrentProcessId()&0xFFFFFFFF);
 	semaphore = CreateSemaphoreA(NULL, 1, 1, sem_name);
 	if (semaphore == NULL) {
-		usbi_err(ctx, "could not create semaphore: %s", windows_error_str(0));
+		usbi_err(ctx,
+			 "could not create semaphore: %s",
+			 windows_error_str(0));
 		return LIBUSB_ERROR_NO_MEM;
 	}
 
 	// A successful wait brings our semaphore count to 0 (unsignaled)
 	// => any concurent wait stalls until the semaphore's release
 	if (WaitForSingleObject(semaphore, INFINITE) != WAIT_OBJECT_0) {
-		usbi_err(ctx, "failure to access semaphore: %s", windows_error_str(0));
+		usbi_err(ctx,
+			 "failure to access semaphore: %s",
+			 windows_error_str(0));
 		CloseHandle(semaphore);
 		return LIBUSB_ERROR_NO_MEM;
 	}
 
 	// NB: concurrent usage supposes that init calls are equally balanced with
 	// exit calls. If init is called more than exit, we will not exit properly
-	if ( ++concurrent_usage == 0 ) {	// First init?
+	if ( ++concurrent_usage == 0 ) { // First init?
 		// Detect OS version
 		memset(&os_version, 0, sizeof(OSVERSIONINFO));
 		os_version.dwOSVersionInfoSize = sizeof(OSVERSIONINFO);
@@ -1078,15 +1707,6 @@ static int windows_init(struct libusb_context *ctx)
 		}
 		SetThreadAffinityMask(timer_thread, 0);
 
-                hotplug_thread = (HANDLE)_beginthreadex(NULL, 0,
-                                                        windows_hotplug_threaded,
-                                                        ctx,
-                                                        0,
-                                                        NULL);
-                if (hotplug_thread == NULL){
-                    usbi_err(ctx, "Unable to create hotplug thread - aborting");
-                    goto init_exit;
-                }
 
 		// Wait for timer thread to init before continuing.
 		if (WaitForSingleObject(timer_response, INFINITE) != WAIT_OBJECT_0) {
@@ -1094,11 +1714,29 @@ static int windows_init(struct libusb_context *ctx)
 			goto init_exit;
 		}
 
+
+		hotplug_thread = (HANDLE)_beginthreadex(NULL, 0,
+							windows_hotplug_threaded,
+							ctx,
+							0,
+							NULL);
+		if (hotplug_thread == NULL){
+			usbi_err(ctx, "Unable to create hotplug thread - aborting");
+			goto init_exit;
+		}
+
+		SetThreadAffinityMask(hotplug_thread, 0);
+
 		// Create a hash table to store session ids. Second parameter is better if prime
-		htab_create(ctx, HTAB_SIZE);
+		if( htab_create(ctx, HTAB_SIZE) == 0 ){
+			goto init_exit;
+		}
 	}
 	// At this stage, either we went through full init successfully, or didn't need to
 	r = LIBUSB_SUCCESS;
+
+	// initial listing
+	windows_hotplug_poll_internal(ctx, 0);
 
 init_exit: // Holds semaphore here.
 	if (!concurrent_usage && r != LIBUSB_SUCCESS) { // First init failed?
@@ -1112,12 +1750,6 @@ init_exit: // Holds semaphore here.
 			CloseHandle(timer_thread);
 			timer_thread = NULL;
 		}
-                if (hotplug_thread) {
-                    // simple cleanup process, just kill the process
-                    TerminateThread(hotplug_thread, 1); // destroy it
-                    CloseHandle(hotplug_thread);
-                    hotplug_thread = NULL;
-                }
 		for (i = 0; i < 2; i++) {
 			if (timer_request[i]) {
 				CloseHandle(timer_request[i]);
@@ -1131,6 +1763,12 @@ init_exit: // Holds semaphore here.
 		if (timer_mutex) {
 			CloseHandle(timer_mutex);
 			timer_mutex = NULL;
+		}
+		if (hotplug_thread) {
+			// simple cleanup process, just kill the process
+			TerminateThread(hotplug_thread, 1); // destroy it
+			CloseHandle(hotplug_thread);
+			hotplug_thread = NULL;
 		}
 		htab_destroy();
 	}
@@ -1161,11 +1799,11 @@ static int force_hcd_device_descriptor(struct libusb_device *dev)
 	priv->dev_descriptor.bNumConfigurations = 1;
 	priv->active_config = 1;
 
-	if (priv->parent_dev == NULL) {
+	if (dev->parent_dev == NULL) {
 		usbi_err(ctx, "program assertion failed - HCD hub has no parent");
 		return LIBUSB_ERROR_NO_DEVICE;
 	}
-	parent_priv = _device_priv(priv->parent_dev);
+	parent_priv = _device_priv(dev->parent_dev);
 	if (sscanf(parent_priv->path, "\\\\.\\PCI#VEN_%04x&DEV_%04x%*s", &vid, &pid) == 2) {
 		priv->dev_descriptor.idVendor = (uint16_t)vid;
 		priv->dev_descriptor.idProduct = (uint16_t)pid;
@@ -1281,8 +1919,11 @@ static int cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handle
 /*
  * Populate a libusbx device structure
  */
-static int init_device(struct libusb_device* dev, struct libusb_device* parent_dev,
-					   uint8_t port_number, char* device_id, DWORD devinst)
+static int init_device(struct libusb_device* dev,
+                       struct libusb_device* parent_dev,
+                       uint8_t port_number,
+                       char* device_id,
+                       DWORD devinst)
 {
 	HANDLE handle;
 	DWORD size;
@@ -1290,11 +1931,14 @@ static int init_device(struct libusb_device* dev, struct libusb_device* parent_d
 	struct windows_device_priv *priv, *parent_priv;
 	struct libusb_context *ctx = DEVICE_CTX(dev);
 	struct libusb_device* tmp_dev;
+	int res;
 	unsigned i;
+	unsigned long tmp_sess_id;
 
 	if ((dev == NULL) || (parent_dev == NULL)) {
 		return LIBUSB_ERROR_NOT_FOUND;
 	}
+
 	priv = _device_priv(dev);
 	parent_priv = _device_priv(parent_dev);
 	if (parent_priv->apib->id != USB_API_HUB) {
@@ -1306,27 +1950,29 @@ static int init_device(struct libusb_device* dev, struct libusb_device* parent_d
 	// If that's the case, lookup the ancestors to set the bus number
 	if (parent_dev->bus_number == 0) {
 		for (i=2; ; i++) {
-			tmp_dev = usbi_get_device_by_session_id(ctx, get_ancestor_session_id(devinst, i));
+			tmp_sess_id = get_ancestor_session_id(devinst, i);
+			tmp_dev = usbi_get_device_by_session_id(ctx, tmp_sess_id);
 			if (tmp_dev == NULL) break;
 			if (tmp_dev->bus_number != 0) {
 				usbi_dbg("got bus number from ancestor #%d", i);
 				parent_dev->bus_number = tmp_dev->bus_number;
-				libusb_unref_device(tmp_dev);
 				break;
 			}
-			libusb_unref_device(tmp_dev);
 		}
 	}
+
 	if (parent_dev->bus_number == 0) {
-		usbi_err(ctx, "program assertion failed: unable to find ancestor bus number for '%s'", device_id);
+		usbi_err(ctx,
+			 "program assertion failed: unable to find ancestor"
+			 " bus number for '%s'", device_id);
 		return LIBUSB_ERROR_NOT_FOUND;
 	}
+
 	dev->bus_number = parent_dev->bus_number;
 	priv->port = port_number;
 	dev->port_number = port_number;
 	priv->depth = parent_priv->depth + 1;
-	priv->parent_dev = parent_dev;
-	dev->parent_dev = parent_dev;
+	dev->parent_dev = libusb_ref_device(parent_dev);
 
 	// If the device address is already set, we can stop here
 	if (dev->device_address != 0) {
@@ -1334,43 +1980,73 @@ static int init_device(struct libusb_device* dev, struct libusb_device* parent_d
 	}
 	memset(&conn_info, 0, sizeof(conn_info));
 	if (priv->depth != 0) {	// Not a HCD hub
-		handle = CreateFileA(parent_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-			FILE_FLAG_OVERLAPPED, NULL);
+		handle = CreateFileA(parent_priv->path,
+				     GENERIC_WRITE,
+				     FILE_SHARE_WRITE,
+				     NULL,
+				     OPEN_EXISTING,
+				     FILE_FLAG_OVERLAPPED,
+				     NULL);
 		if (handle == INVALID_HANDLE_VALUE) {
-			usbi_warn(ctx, "could not open hub %s: %s", parent_priv->path, windows_error_str(0));
+			usbi_warn(ctx,
+				  "could not open hub %s: %s",
+				  parent_priv->path,
+				  windows_error_str(0));
 			return LIBUSB_ERROR_ACCESS;
 		}
 		size = sizeof(conn_info);
 		conn_info.ConnectionIndex = (ULONG)port_number;
-		if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info, size,
-			&conn_info, size, &size, NULL)) {
-			usbi_warn(ctx, "could not get node connection information for device '%s': %s",
-				device_id, windows_error_str(0));
-			safe_closehandle(handle);
-			return LIBUSB_ERROR_NO_DEVICE;
-		}
+		if (!DeviceIoControl(handle,
+				     IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX,
+				     &conn_info,
+				     size,
+				     &conn_info,
+				     size,
+				     &size,
+				     NULL))
+			{
+				usbi_warn(ctx,
+					  "could not get node connection information for"
+					  " device '%s': %s",
+					  device_id,
+					  windows_error_str(0));
+				safe_closehandle(handle);
+				return LIBUSB_ERROR_NO_DEVICE;
+			}
 		if (conn_info.ConnectionStatus == NoDeviceConnected) {
-			usbi_err(ctx, "device '%s' is no longer connected!", device_id);
+			usbi_err(ctx,
+					 "device '%s' is no longer connected!",
+					 device_id);
 			safe_closehandle(handle);
 			return LIBUSB_ERROR_NO_DEVICE;
 		}
-		memcpy(&priv->dev_descriptor, &(conn_info.DeviceDescriptor), sizeof(USB_DEVICE_DESCRIPTOR));
+		memcpy(&priv->dev_descriptor,
+			   &(conn_info.DeviceDescriptor),
+			   sizeof(USB_DEVICE_DESCRIPTOR));
 		dev->num_configurations = priv->dev_descriptor.bNumConfigurations;
 		priv->active_config = conn_info.CurrentConfigurationValue;
-		usbi_dbg("found %d configurations (active conf: %d)", dev->num_configurations, priv->active_config);
-		// If we can't read the config descriptors, just set the number of confs to zero
-		if (cache_config_descriptors(dev, handle, device_id) != LIBUSB_SUCCESS) {
+		usbi_dbg("found %d configurations (active conf: %d)",
+				 dev->num_configurations,
+				 priv->active_config);
+		// If we can't read the config descriptors, just set the number
+		// of confs to zero
+		res = cache_config_descriptors(dev, handle, device_id);
+		if ( res != LIBUSB_SUCCESS) {
 			dev->num_configurations = 0;
 			priv->dev_descriptor.bNumConfigurations = 0;
 		}
 		safe_closehandle(handle);
 
 		if (conn_info.DeviceAddress > UINT8_MAX) {
-			usbi_err(ctx, "program assertion failed: device address overflow");
+			usbi_err(ctx,
+					 "program assertion failed: device address"
+					 " overflow");
 		}
 		dev->device_address = (uint8_t)conn_info.DeviceAddress + 1;
 		if (dev->device_address == 1) {
-			usbi_err(ctx, "program assertion failed: device address collision with root hub");
+			usbi_err(ctx,
+					 "program assertion failed: device address "
+					 "collision with root hub");
 		}
 		switch (conn_info.Speed) {
 		case 0: dev->speed = LIBUSB_SPEED_LOW; break;
@@ -1378,18 +2054,25 @@ static int init_device(struct libusb_device* dev, struct libusb_device* parent_d
 		case 2: dev->speed = LIBUSB_SPEED_HIGH; break;
 		case 3: dev->speed = LIBUSB_SPEED_SUPER; break;
 		default:
-			usbi_warn(ctx, "Got unknown device speed %d", conn_info.Speed);
+			usbi_warn(ctx,
+					  "Got unknown device speed %d",
+					  conn_info.Speed);
 			break;
 		}
 	} else {
-		dev->device_address = 1;	// root hubs are set to use device number 1
+		// root hubs are set to use device number 1
+		dev->device_address = 1;
 		force_hcd_device_descriptor(dev);
 	}
 
 	usbi_sanitize_device(dev);
 
 	usbi_dbg("(bus: %d, addr: %d, depth: %d, port: %d): '%s'",
-		dev->bus_number, dev->device_address, priv->depth, priv->port, device_id);
+			 dev->bus_number,
+			 dev->device_address,
+			 priv->depth,
+			 priv->port,
+			 device_id);
 
 	return LIBUSB_SUCCESS;
 }
@@ -1533,372 +2216,19 @@ static int set_hid_interface(struct libusb_context* ctx, struct libusb_device* d
 }
 
 /*
- * get_device_list: libusbx backend device enumeration function
- */
-static int windows_get_device_list(struct libusb_context *ctx, struct discovered_devs **_discdevs)
-{
-	struct discovered_devs *discdevs;
-	HDEVINFO dev_info = { 0 };
-	const char* usb_class[] = {"USB", "NUSB3", "IUSB3"};
-	SP_DEVINFO_DATA dev_info_data = { 0 };
-	SP_DEVICE_INTERFACE_DETAIL_DATA_A *dev_interface_details = NULL;
-	GUID hid_guid;
-#define MAX_ENUM_GUIDS 64
-	const GUID* guid[MAX_ENUM_GUIDS];
-#define HCD_PASS 0
-#define HUB_PASS 1
-#define GEN_PASS 2
-#define DEV_PASS 3
-#define HID_PASS 4
-	int r = LIBUSB_SUCCESS;
-	int api, sub_api;
-	size_t class_index = 0;
-	unsigned int nb_guids, pass, i, j, ancestor;
-	char path[MAX_PATH_LENGTH];
-	char strbuf[MAX_PATH_LENGTH];
-	struct libusb_device *dev, *parent_dev;
-	struct windows_device_priv *priv, *parent_priv;
-	char* dev_interface_path = NULL;
-	char* dev_id_path = NULL;
-	unsigned long session_id;
-	DWORD size, reg_type, port_nr, install_state;
-	HKEY key;
-	WCHAR guid_string_w[MAX_GUID_STRING_LENGTH];
-	GUID* if_guid;
-	LONG s;
-	// Keep a list of newly allocated devs to unref
-	libusb_device** unref_list;
-	unsigned int unref_size = 64;
-	unsigned int unref_cur = 0;
-
-	// PASS 1 : (re)enumerate HCDs (allows for HCD hotplug)
-	// PASS 2 : (re)enumerate HUBS
-	// PASS 3 : (re)enumerate generic USB devices (including driverless)
-	//           and list additional USB device interface GUIDs to explore
-	// PASS 4 : (re)enumerate master USB devices that have a device interface
-	// PASS 5+: (re)enumerate device interfaced GUIDs (including HID) and
-	//           set the device interfaces.
-
-	// Init the GUID table
-	guid[HCD_PASS] = &GUID_DEVINTERFACE_USB_HOST_CONTROLLER;
-	guid[HUB_PASS] = &GUID_DEVINTERFACE_USB_HUB;
-	guid[GEN_PASS] = NULL;
-	guid[DEV_PASS] = &GUID_DEVINTERFACE_USB_DEVICE;
-	HidD_GetHidGuid(&hid_guid);
-	guid[HID_PASS] = &hid_guid;
-	nb_guids = HID_PASS+1;
-
-	unref_list = (libusb_device**) calloc(unref_size, sizeof(libusb_device*));
-	if (unref_list == NULL) {
-		return LIBUSB_ERROR_NO_MEM;
-	}
-
-	for (pass = 0; ((pass < nb_guids) && (r == LIBUSB_SUCCESS)); pass++) {
-//#define ENUM_DEBUG
-#ifdef ENUM_DEBUG
-		const char *passname[] = { "HCD", "HUB", "GEN", "DEV", "HID", "EXT" };
-		usbi_dbg("\n#### PROCESSING %ss %s", passname[(pass<=HID_PASS)?pass:HID_PASS+1],
-			(pass!=GEN_PASS)?guid_to_string(guid[pass]):"");
-#endif
-		for (i = 0; ; i++) {
-			// safe loop: free up any (unprotected) dynamic resource
-			// NB: this is always executed before breaking the loop
-			safe_free(dev_interface_details);
-			safe_free(dev_interface_path);
-			safe_free(dev_id_path);
-			priv = parent_priv = NULL;
-			dev = parent_dev = NULL;
-
-			// Safe loop: end of loop conditions
-			if (r != LIBUSB_SUCCESS) {
-				break;
-			}
-			if ((pass == HCD_PASS) && (i == UINT8_MAX)) {
-				usbi_warn(ctx, "program assertion failed - found more than %d buses, skipping the rest.", UINT8_MAX);
-				break;
-			}
-			if (pass != GEN_PASS) {
-				// Except for GEN, all passes deal with device interfaces
-				dev_interface_details = get_interface_details(ctx, &dev_info, &dev_info_data, guid[pass], i);
-				if (dev_interface_details == NULL) {
-					break;
-				} else {
-					dev_interface_path = sanitize_path(dev_interface_details->DevicePath);
-					if (dev_interface_path == NULL) {
-						usbi_warn(ctx, "could not sanitize device interface path for '%s'", dev_interface_details->DevicePath);
-						continue;
-					}
-				}
-			} else {
-				// Workaround for a Nec/Renesas USB 3.0 driver bug where root hubs are
-				// being listed under the "NUSB3" PnP Symbolic Name rather than "USB".
-				// The Intel USB 3.0 driver behaves similar, but uses "IUSB3"
-				for (; class_index < ARRAYSIZE(usb_class); class_index++) {
-					if (get_devinfo_data(ctx, &dev_info, &dev_info_data, usb_class[class_index], i))
-						break;
-					i = 0;
-				}
-				if (class_index >= ARRAYSIZE(usb_class))
-					break;
-			}
-
-			// Read the Device ID path. This is what we'll use as UID
-			// Note that if the device is plugged in a different port or hub, the Device ID changes
-			if (CM_Get_Device_IDA(dev_info_data.DevInst, path, sizeof(path), 0) != CR_SUCCESS) {
-				usbi_warn(ctx, "could not read the device id path for devinst %X, skipping",
-					dev_info_data.DevInst);
-				continue;
-			}
-			dev_id_path = sanitize_path(path);
-			if (dev_id_path == NULL) {
-				usbi_warn(ctx, "could not sanitize device id path for devinst %X, skipping",
-					dev_info_data.DevInst);
-				continue;
-			}
-#ifdef ENUM_DEBUG
-			usbi_dbg("PRO: %s", dev_id_path);
-#endif
-
-			// The SPDRP_ADDRESS for USB devices is the device port number on the hub
-			port_nr = 0;
-			if ((pass >= HUB_PASS) && (pass <= GEN_PASS)) {
-				if ( (!pSetupDiGetDeviceRegistryPropertyA(dev_info, &dev_info_data, SPDRP_ADDRESS,
-					&reg_type, (BYTE*)&port_nr, 4, &size))
-				  || (size != 4) ) {
-					usbi_warn(ctx, "could not retrieve port number for device '%s', skipping: %s",
-						dev_id_path, windows_error_str(0));
-					continue;
-				}
-			}
-
-			// Set API to use or get additional data from generic pass
-			api = USB_API_UNSUPPORTED;
-			sub_api = SUB_API_NOTSET;
-			switch (pass) {
-			case HCD_PASS:
-				break;
-			case GEN_PASS:
-				// We use the GEN pass to detect driverless devices...
-				size = sizeof(strbuf);
-				if (!pSetupDiGetDeviceRegistryPropertyA(dev_info, &dev_info_data, SPDRP_DRIVER,
-					&reg_type, (BYTE*)strbuf, size, &size)) {
-						usbi_info(ctx, "The following device has no driver: '%s'", dev_id_path);
-						usbi_info(ctx, "libusbx will not be able to access it.");
-				}
-				// ...and to add the additional device interface GUIDs
-				key = pSetupDiOpenDevRegKey(dev_info, &dev_info_data, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
-				if (key != INVALID_HANDLE_VALUE) {
-					size = sizeof(guid_string_w);
-					s = pRegQueryValueExW(key, L"DeviceInterfaceGUIDs", NULL, &reg_type,
-						(BYTE*)guid_string_w, &size);
-					pRegCloseKey(key);
-					if (s == ERROR_SUCCESS) {
-						if (nb_guids >= MAX_ENUM_GUIDS) {
-							// If this assert is ever reported, grow a GUID table dynamically
-							usbi_err(ctx, "program assertion failed: too many GUIDs");
-							LOOP_BREAK(LIBUSB_ERROR_OVERFLOW);
-						}
-						if_guid = (GUID*) calloc(1, sizeof(GUID));
-						pCLSIDFromString(guid_string_w, if_guid);
-						guid[nb_guids++] = if_guid;
-						usbi_dbg("extra GUID: %s", guid_to_string(if_guid));
-					}
-				}
-				break;
-			case HID_PASS:
-				api = USB_API_HID;
-				break;
-			default:
-				// Get the API type (after checking that the driver installation is OK)
-				if ( (!pSetupDiGetDeviceRegistryPropertyA(dev_info, &dev_info_data, SPDRP_INSTALL_STATE,
-					&reg_type, (BYTE*)&install_state, 4, &size))
-				  || (size != 4) ){
-					usbi_warn(ctx, "could not detect installation state of driver for '%s': %s",
-						dev_id_path, windows_error_str(0));
-				} else if (install_state != 0) {
-					usbi_warn(ctx, "driver for device '%s' is reporting an issue (code: %d) - skipping",
-						dev_id_path, install_state);
-					continue;
-				}
-				get_api_type(ctx, &dev_info, &dev_info_data, &api, &sub_api);
-				break;
-			}
-
-			// Find parent device (for the passes that need it)
-			switch (pass) {
-			case HCD_PASS:
-			case DEV_PASS:
-			case HUB_PASS:
-				break;
-			default:
-				// Go through the ancestors until we see a face we recognize
-				parent_dev = NULL;
-				for (ancestor = 1; parent_dev == NULL; ancestor++) {
-					session_id = get_ancestor_session_id(dev_info_data.DevInst, ancestor);
-					if (session_id == 0) {
-						break;
-					}
-					parent_dev = usbi_get_device_by_session_id(ctx, session_id);
-				}
-				if (parent_dev == NULL) {
-					usbi_dbg("unlisted ancestor for '%s' (non USB HID, newly connected, etc.) - ignoring", dev_id_path);
-					continue;
-				}
-				parent_priv = _device_priv(parent_dev);
-				// virtual USB devices are also listed during GEN - don't process these yet
-				if ( (pass == GEN_PASS) && (parent_priv->apib->id != USB_API_HUB) ) {
-				        libusb_unref_device(parent_dev);
-					continue;
-				}
-				break;
-			}
-
-			// Create new or match existing device, using the (hashed) device_id as session id
-			if (pass <= DEV_PASS) {	// For subsequent passes, we'll lookup the parent
-				// These are the passes that create "new" devices
-				session_id = htab_hash(dev_id_path);
-				dev = usbi_get_device_by_session_id(ctx, session_id);
-				if (dev == NULL) {
-					if (pass == DEV_PASS) {
-						// This can occur if the OS only reports a newly plugged device after we started enum
-						usbi_warn(ctx, "'%s' was only detected in late pass (newly connected device?)"
-							" - ignoring", dev_id_path);
-						continue;
-					}
-					usbi_dbg("allocating new device for session [%X]", session_id);
-					if ((dev = usbi_alloc_device(ctx, session_id)) == NULL) {
-						LOOP_BREAK(LIBUSB_ERROR_NO_MEM);
-					}
-					windows_device_priv_init(dev);
-				} else {
-					usbi_dbg("found existing device for session [%X] (%d.%d)",
-						session_id, dev->bus_number, dev->device_address);
-				}
-                                // Keep track of devices that need unref
-                                unref_list[unref_cur++] = dev;
-                                if (unref_cur >= unref_size) {
-                                        unref_size += 64;
-                                        unref_list = usbi_reallocf(unref_list, unref_size*sizeof(libusb_device*));
-                                        if (unref_list == NULL) {
-                                                usbi_err(ctx, "could not realloc list for unref - aborting.");
-                                                LOOP_BREAK(LIBUSB_ERROR_NO_MEM);
-                                        }
-                                }
-				priv = _device_priv(dev);
-			}
-
-			// Setup device
-			switch (pass) {
-			case HCD_PASS:
-				dev->bus_number = (uint8_t)(i + 1);	// bus 0 is reserved for disconnected
-				dev->device_address = 0;
-				dev->num_configurations = 0;
-				priv->apib = &usb_api_backend[USB_API_HUB];
-				priv->sub_api = SUB_API_NOTSET;
-				priv->depth = UINT8_MAX;	// Overflow to 0 for HCD Hubs
-				priv->path = dev_interface_path; dev_interface_path = NULL;
-				break;
-			case HUB_PASS:
-			case DEV_PASS:
-				// If the device has already been setup, don't do it again
-				if (priv->path != NULL)
-					break;
-				// Take care of API initialization
-				priv->path = dev_interface_path; dev_interface_path = NULL;
-				priv->apib = &usb_api_backend[api];
-				priv->sub_api = sub_api;
-				switch(api) {
-				case USB_API_COMPOSITE:
-				case USB_API_HUB:
-					break;
-				case USB_API_HID:
-					priv->hid = calloc(1, sizeof(struct hid_device_priv));
-					if (priv->hid == NULL) {
-						LOOP_BREAK(LIBUSB_ERROR_NO_MEM);
-					}
-					priv->hid->nb_interfaces = 0;
-					break;
-				default:
-					// For other devices, the first interface is the same as the device
-					priv->usb_interface[0].path = (char*) calloc(safe_strlen(priv->path)+1, 1);
-					if (priv->usb_interface[0].path != NULL) {
-						safe_strcpy(priv->usb_interface[0].path, safe_strlen(priv->path)+1, priv->path);
-					} else {
-						usbi_warn(ctx, "could not duplicate interface path '%s'", priv->path);
-					}
-					// The following is needed if we want API calls to work for both simple
-					// and composite devices.
-					for(j=0; j<USB_MAXINTERFACES; j++) {
-						priv->usb_interface[j].apib = &usb_api_backend[api];
-					}
-					break;
-				}
-				break;
-			case GEN_PASS:
-				r = init_device(dev, parent_dev, (uint8_t)port_nr, dev_id_path, dev_info_data.DevInst);
-				if (r == LIBUSB_SUCCESS) {
-					// Append device to the list of discovered devices
-					discdevs = discovered_devs_append(*_discdevs, dev);
-					if (!discdevs) {
-						LOOP_BREAK(LIBUSB_ERROR_NO_MEM);
-					}
-					*_discdevs = discdevs;
-				} else if (r == LIBUSB_ERROR_NO_DEVICE) {
-					// This can occur if the device was disconnected but Windows hasn't
-					// refreshed its enumeration yet - in that case, we ignore the device
-					r = LIBUSB_SUCCESS;
-				}
-				break;
-			default:	// HID_PASS and later
-				if (parent_priv->apib->id == USB_API_HID) {
-					usbi_dbg("setting HID interface for [%lX]:", parent_dev->session_data);
-					r = set_hid_interface(ctx, parent_dev, dev_interface_path);
-					if (r != LIBUSB_SUCCESS) LOOP_BREAK(r);
-					dev_interface_path = NULL;
-				} else if (parent_priv->apib->id == USB_API_COMPOSITE) {
-					usbi_dbg("setting composite interface for [%lX]:", parent_dev->session_data);
-					switch (set_composite_interface(ctx, parent_dev, dev_interface_path, dev_id_path, api, sub_api)) {
-					case LIBUSB_SUCCESS:
-						dev_interface_path = NULL;
-						break;
-					case LIBUSB_ERROR_ACCESS:
-						// interface has already been set => make sure dev_interface_path is freed then
-						break;
-					default:
-						LOOP_BREAK(r);
-						break;
-					}
-				}
-			        libusb_unref_device(parent_dev);
-				break;
-			}
-		}
-	}
-
-	// Free any additional GUIDs
-	for (pass = HID_PASS+1; pass < nb_guids; pass++) {
-		safe_free(guid[pass]);
-	}
-
-	// Unref newly allocated devs
-	for (i=0; i<unref_cur; i++) {
-		safe_unref_device(unref_list[i]);
-	}
-	safe_free(unref_list);
-
-	return r;
-}
-
-/*
  * exit: libusbx backend deinitialization function
  */
 static void windows_exit(void)
 {
 	int i;
 	HANDLE semaphore;
+	DWORD ret;
 	char sem_name[11+1+8]; // strlen(libusb_init)+'\0'+(32-bit hex PID)
 
-	sprintf(sem_name, "libusb_init%08X", (unsigned int)GetCurrentProcessId()&0xFFFFFFFF);
+	usbi_dbg("");
+
+	sprintf(sem_name, "libusb_init%08X",
+		(unsigned int)GetCurrentProcessId()&0xFFFFFFFF);
 	semaphore = CreateSemaphoreA(NULL, 1, 1, sem_name);
 	if (semaphore == NULL) {
 		return;
@@ -1906,7 +2236,8 @@ static void windows_exit(void)
 
 	// A successful wait brings our semaphore count to 0 (unsignaled)
 	// => any concurent wait stalls until the semaphore release
-	if (WaitForSingleObject(semaphore, INFINITE) != WAIT_OBJECT_0) {
+	ret = WaitForSingleObject(semaphore, INFINITE);
+	if ( ret != WAIT_OBJECT_0) {
 		CloseHandle(semaphore);
 		return;
 	}
@@ -1919,29 +2250,54 @@ static void windows_exit(void)
 		exit_polling();
 
 		if (timer_thread) {
-			SetEvent(timer_request[1]); // actually the signal to quit the thread.
-			if (WAIT_OBJECT_0 != WaitForSingleObject(timer_thread, INFINITE)) {
+			// actually the signal to quit the thread.
+			SetEvent(timer_request[1]);
+			ret = WaitForSingleObject(timer_thread, INFINITE);
+			if (WAIT_OBJECT_0 != ret) {
 				usbi_dbg("could not wait for timer thread to quit");
 				TerminateThread(timer_thread, 1);
 			}
 			CloseHandle(timer_thread);
 			timer_thread = NULL;
 		}
+		usbi_dbg("timer_thread is now NULL");
+
 		for (i = 0; i < 2; i++) {
 			if (timer_request[i]) {
 				CloseHandle(timer_request[i]);
 				timer_request[i] = NULL;
 			}
 		}
+		usbi_dbg("timer_request are now NULL");
+
 		if (timer_response) {
 			CloseHandle(timer_response);
 			timer_response = NULL;
 		}
+		usbi_dbg("timer_response is now NULL");
+
 		if (timer_mutex) {
 			CloseHandle(timer_mutex);
 			timer_mutex = NULL;
 		}
+		usbi_dbg("timer_mutex is now NULL");
+
+		if (hHotplugMessage) {
+			// signal thread to exit
+			ret = PostMessage(hHotplugMessage, WM_QUIT, 0, 0);
+			ret = WaitForSingleObject( hotplug_thread, INFINITE);
+			if (WAIT_OBJECT_0 != ret) {
+				usbi_dbg("could not wait for hotplug thread to quit");
+				TerminateThread(hotplug_thread, 1);
+			}
+			CloseHandle(hotplug_thread);
+			hotplug_thread = NULL;
+			hHotplugMessage = NULL;
+		}
+		usbi_dbg("hotplug_thread is now NULL");
+
 		htab_destroy();
+		usbi_dbg("htab destroyed");
 	}
 
 	ReleaseSemaphore(semaphore, 1, NULL);	// increase count back to 1
@@ -2123,9 +2479,51 @@ static int windows_detach_kernel_driver(struct libusb_device_handle *dev_handle,
 	return LIBUSB_ERROR_NOT_SUPPORTED;
 }
 
+static void windows_device_priv_release(libusb_device* dev) {
+	int i;
+	struct windows_device_priv* p;
+
+	if (dev == NULL) {
+		usbi_err(NULL, "no device");
+		return;
+	}
+
+	p = _device_priv(dev);
+
+	if ( p == NULL ){
+		return;
+	}
+
+	safe_free(p->path);
+	if ((dev->num_configurations > 0) && (p->config_descriptor != NULL))
+		for (i=0; i < dev->num_configurations; i++)
+			safe_free(p->config_descriptor[i]);
+
+	safe_free(p->config_descriptor);
+	safe_free(p->hid);
+
+	for (i=0; i<USB_MAXINTERFACES; i++) {
+		safe_free(p->usb_interface[i].path);
+		safe_free(p->usb_interface[i].endpoint);
+	}
+}
+
 static void windows_destroy_device(struct libusb_device *dev)
 {
+	usbi_dbg("");
+	if (dev == NULL) {
+		usbi_err(NULL, "no device to release");
+		return;
+	}
+
+	struct windows_device_priv *priv = _device_priv(dev);
+	if (priv == NULL){
+		usbi_err(dev->ctx, "double destroy");
+		return;
+	}
+
 	windows_device_priv_release(dev);
+	usbi_dbg("done");
 }
 
 static void windows_clear_transfer_priv(struct usbi_transfer *itransfer)
@@ -2527,7 +2925,6 @@ const struct usbi_os_backend windows_backend = {
 #if defined(USBI_TIMERFD_AVAILABLE)
 	NULL,
 #endif
-	sizeof(struct windows_context_priv),
 	sizeof(struct windows_device_priv),
 	sizeof(struct windows_device_handle_priv),
 	sizeof(struct windows_transfer_priv),
