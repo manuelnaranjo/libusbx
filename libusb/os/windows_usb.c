@@ -893,7 +893,8 @@ static void auto_release(struct usbi_transfer *itransfer)
 struct libusb_device * get_hotplug_device_node( const char* name,
 						struct libusb_context* ctx,
 						BOOL online,
-						uint8_t hcd)
+						uint8_t hcd,
+						BOOL hotplug_poll)
 {
 	TCHAR* devId = NULL, *class = NULL, *guid = NULL,
 		*dev_interface_path = NULL, *dev_id_path = NULL;
@@ -916,9 +917,11 @@ struct libusb_device * get_hotplug_device_node( const char* name,
 
 	dev_interface_path = sanitize_path(name);
 	session_id = htab_hash(dev_interface_path);
-	if (usbi_get_device_by_session_id(ctx, session_id)){
+	dev = usbi_get_device_by_session_id(ctx, session_id);
+	if (dev){
 		usbi_info(ctx, "found device in session");
-		dev = usbi_get_device_by_session_id(ctx, session_id);
+		if (hotplug_poll)
+			libusb_unref_device(dev);
 		goto cleanup_after_devinfo;
 	}
 
@@ -1009,9 +1012,11 @@ struct libusb_device * get_hotplug_device_node( const char* name,
 	};
 
 	session_id = htab_hash(dev_id_path);
-	if (usbi_get_device_by_session_id(ctx, session_id)){
+	dev = usbi_get_device_by_session_id(ctx, session_id);
+	if (dev){
 		usbi_info(ctx, "found device in session");
-		dev = usbi_get_device_by_session_id(ctx, session_id);
+		if (hotplug_poll)
+			libusb_unref_device(dev);
 		goto cleanup;
 	}
 
@@ -1070,7 +1075,8 @@ struct libusb_device * get_hotplug_device_node( const char* name,
 		if (hcd==0){
 			parent_dev = get_hotplug_device_node(parent_path, ctx,
 							     TRUE, // connected
-							     FALSE // not hcd
+							     FALSE, // not hcd,
+							     hotplug_poll
 				);
 			if (parent_dev == NULL) {
 				usbi_warn(ctx, "failed resolving parent");
@@ -1171,21 +1177,13 @@ struct libusb_device * get_hotplug_device_node( const char* name,
 		goto cleanup;
 	}
 
-	if (online)
+	if (online && !dev->attached)
 		usbi_connect_device(dev);
-	else
+	else if (!online && dev->attached) {
 		usbi_disconnect_device(dev);
-
-	if (hcd) {
-		//this is a special case, when we call init_device parent_dev gets
-		//+1 on it's reference count, but we don't want the hcd objects
-		//to stay alive after the hub device is gone, or if multiple hubs
-		//have the same hcd parent, we want the parent to be gone once all
-		//it's child are gone. We could register our device with
-		//usbi_connect_device but this would add the device to the context
-		//known devices then it would get listed with get_device_list
-		libusb_unref_device(parent_dev);
+		libusb_unref_device(dev);
 	}
+
   cleanup:
 	pSetupDiDestroyDeviceInfoList(devinfo);
   cleanup_after_devinfo:
@@ -1194,7 +1192,15 @@ struct libusb_device * get_hotplug_device_node( const char* name,
 	free(class);
 	free(guid);
 	free(dev_id_path);
+
+	if (dev == NULL) {
+		// when parent_dev reference was received it was done either
+		// through usbi_get_device_by_session_id
+		libusb_unref_device(parent_dev);
+	}
+
 	usbi_dbg("done");
+
 	return dev;
 }
 
@@ -1229,7 +1235,9 @@ LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
 
 		dev = get_hotplug_device_node(dev_bdi->dbcc_name, ctx,
 					      (wParam == DBT_DEVICEARRIVAL),
-					      FALSE); // not hcd
+					      FALSE, // not hcd
+					      FALSE  // not hotplug poll
+			);
 
 		if (!dev){
 			usbi_warn(ctx, "no new dev node ignoring");
@@ -1247,8 +1255,10 @@ LRESULT CALLBACK message_callback_handle_device_change(HWND hWnd,
 
 		if (online && !dev->attached)
 			usbi_connect_device(dev);
-		else if (!online && dev->attached)
+		else if (!online && dev->attached) {
 			usbi_disconnect_device(dev);
+			libusb_unref_device(dev);
+		}
 	}
 	usbi_mutex_static_unlock(&active_contexts_lock);
 
@@ -1385,7 +1395,8 @@ void windows_hotplug_poll(void){
 			dev = get_hotplug_device_node(
 				dev_interface_details->DevicePath, ctx,
 				TRUE, // connected
-				i+1   // it's an hcd bus_number=i+1
+				i+1,  // it's an hcd bus_number=i+1,
+				TRUE  // hotplug poll
 				);
 
 			safe_free(dev_interface_details);
@@ -1414,8 +1425,9 @@ void windows_hotplug_poll(void){
 
 			dev = get_hotplug_device_node(
 				dev_interface_details->DevicePath, ctx,
-				TRUE, // connected
-				FALSE // not hcd
+				TRUE,  // connected
+				FALSE, // not hcd
+				TRUE   // hotplug poll stage
 				);
 
 			safe_free(dev_interface_details);
@@ -1760,7 +1772,7 @@ static int init_device(struct libusb_device* dev,
 	struct windows_device_priv *priv, *parent_priv;
 	struct libusb_context *ctx = DEVICE_CTX(dev);
 	struct libusb_device* tmp_dev;
-	int res;
+	int res, parent_bus_number;
 	unsigned i;
 	unsigned long tmp_sess_id;
 
@@ -1784,9 +1796,11 @@ static int init_device(struct libusb_device* dev,
 			tmp_sess_id = get_ancestor_session_id(devinst, i);
 			tmp_dev = usbi_get_device_by_session_id(ctx, tmp_sess_id);
 			if (tmp_dev == NULL) break;
-			if (tmp_dev->bus_number != 0) {
+			parent_bus_number = tmp_dev->bus_number;
+			libusb_unref_device(tmp_dev);
+			if ( parent_bus_number != 0) {
 				usbi_dbg("got bus number from ancestor #%d", i);
-				parent_dev->bus_number = tmp_dev->bus_number;
+				parent_dev->bus_number = parent_bus_number;
 				break;
 			}
 		}
@@ -1806,7 +1820,7 @@ static int init_device(struct libusb_device* dev,
 
 	// If the device address is already set, we can stop here
 	if (dev->device_address != 0) {
-		dev->parent_dev = libusb_ref_device(parent_dev);
+		dev->parent_dev = parent_dev;
 		return LIBUSB_SUCCESS;
 	}
 	memset(&conn_info, 0, sizeof(conn_info));
@@ -1890,11 +1904,11 @@ static int init_device(struct libusb_device* dev,
 					  conn_info.Speed);
 			break;
 		}
-		dev->parent_dev = libusb_ref_device(parent_dev);
+		dev->parent_dev = parent_dev;
 	} else {
 		// root hubs are set to use device number 1
 		dev->device_address = 1;
-		dev->parent_dev = libusb_ref_device(parent_dev);
+		dev->parent_dev = parent_dev;
 		force_hcd_device_descriptor(dev);
 	}
 
