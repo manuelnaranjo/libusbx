@@ -43,6 +43,12 @@ typedef LPSTR PTSTR;
 #endif
 #endif
 
+#ifdef _MSC_VER
+#   define FIELD_INIT(field, ...) __VA_ARGS__
+#else
+#   define FIELD_INIT(field, ...) field = __VA_ARGS__
+#endif
+
 #if defined(_MSC_VER)
 // disable /W4 MSVC warnings that are benign
 #pragma warning(disable:4127) // conditional expression is constant
