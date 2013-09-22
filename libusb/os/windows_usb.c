@@ -479,7 +479,7 @@ static SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details_filter(struct li
 		usbi_err(ctx, "program assertion failed - http://msdn.microsoft.com/en-us/library/ms792901.aspx is wrong.");
 		goto err_exit;
 	}
-	if ((dev_interface_details = malloc(size)) == NULL) {
+	if ((dev_interface_details = (SP_DEVICE_INTERFACE_DETAIL_DATA_A*)malloc(size)) == NULL) {
 		usbi_err(ctx, "could not allocate interface data for index %u.", _index);
 		goto err_exit;
 	}
@@ -580,8 +580,9 @@ static int htab_create(struct libusb_context *ctx, unsigned long nel)
 /* After using the hash table it has to be destroyed.  */
 static void htab_destroy(void)
 {
-	usbi_dbg("");
 	size_t i;
+	
+	usbi_dbg("");
 	if (htab_table == NULL) {
 		usbi_dbg("no table");
 		return;
@@ -896,16 +897,16 @@ struct libusb_device * get_hotplug_device_node( const char* name,
 						uint8_t hcd,
 						BOOL hotplug_poll)
 {
-	TCHAR* devId = NULL, *class = NULL, *guid = NULL,
-		*dev_interface_path = NULL, *dev_id_path = NULL;
 	TCHAR path[MAX_PATH_LENGTH];
 	HDEVINFO devinfo;
 	DWORD dwFlag, port_nr, reg_type, size, install_state;
-	SP_DEVINFO_DATA dev_info_data = { 0 };
 	int session_id, i, nlen, ret, api, sub_api, ancestor_id;
-	BOOL found;;
-	struct libusb_device * dev = NULL, * parent_dev = NULL;
+	BOOL found;
 	struct windows_device_priv *priv;
+	SP_DEVINFO_DATA dev_info_data = { 0 };
+	TCHAR* devId = NULL, *class = NULL, *guid = NULL,
+		*dev_interface_path = NULL, *dev_id_path = NULL;
+	struct libusb_device * dev = NULL, * parent_dev = NULL;
 
 	usbi_dbg(name);
 
@@ -2357,13 +2358,14 @@ static void windows_device_priv_release(libusb_device* dev) {
 
 static void windows_destroy_device(struct libusb_device *dev)
 {
+	struct windows_device_priv *priv;
 	usbi_dbg("");
 	if (dev == NULL) {
 		usbi_err(NULL, "no device to release");
 		return;
 	}
 
-	struct windows_device_priv *priv = _device_priv(dev);
+	priv = _device_priv(dev);
 	if (priv == NULL){
 		usbi_err(dev->ctx, "double destroy");
 		return;
@@ -2729,53 +2731,52 @@ static int windows_clock_gettime(int clk_id, struct timespec *tp)
 	}
 }
 
-
 // NB: MSVC6 does not support named initializers.
 const struct usbi_os_backend windows_backend = {
-	.name = "Windows",
-	.caps = USBI_CAP_HAS_HID_ACCESS,
-	.init = windows_init,
-	.exit = windows_exit,
+	FIELD_INIT(.name, "Windows"),
+	FIELD_INIT(.caps, USBI_CAP_HAS_HID_ACCESS),
+	FIELD_INIT(.init, windows_init),
+	FIELD_INIT(.exit, windows_exit),
 
-	.get_device_list = NULL, //windows_get_device_list,
-	.hotplug_poll = windows_hotplug_poll, /* hotplug_poll */
-	.open = windows_open,
-	.close = windows_close,
+	FIELD_INIT(.get_device_list, NULL), //windows_get_device_list,
+	FIELD_INIT(.hotplug_poll, windows_hotplug_poll), /* hotplug_poll */
+	FIELD_INIT(.open, windows_open),
+	FIELD_INIT(.close, windows_close),
 
-	.get_device_descriptor = windows_get_device_descriptor,
-	.get_active_config_descriptor = windows_get_active_config_descriptor,
-	.get_config_descriptor = windows_get_config_descriptor,
-	.get_config_descriptor_by_value = NULL,
+	FIELD_INIT(.get_device_descriptor, windows_get_device_descriptor),
+	FIELD_INIT(.get_active_config_descriptor, windows_get_active_config_descriptor),
+	FIELD_INIT(.get_config_descriptor, windows_get_config_descriptor),
+	FIELD_INIT(.get_config_descriptor_by_value, NULL),
 
-	.get_configuration = windows_get_configuration,
-	.set_configuration = windows_set_configuration,
-	.claim_interface = windows_claim_interface,
-	.release_interface = windows_release_interface,
+	FIELD_INIT(.get_configuration, windows_get_configuration),
+	FIELD_INIT(.set_configuration, windows_set_configuration),
+	FIELD_INIT(.claim_interface, windows_claim_interface),
+	FIELD_INIT(.release_interface, windows_release_interface),
 
-	.set_interface_altsetting = windows_set_interface_altsetting,
-	.clear_halt = windows_clear_halt,
-	.reset_device = windows_reset_device,
+	FIELD_INIT(.set_interface_altsetting, windows_set_interface_altsetting),
+	FIELD_INIT(.clear_halt, windows_clear_halt),
+	FIELD_INIT(.reset_device, windows_reset_device),
 
-	.kernel_driver_active = windows_kernel_driver_active,
-	.detach_kernel_driver = windows_detach_kernel_driver,
-	.attach_kernel_driver = windows_attach_kernel_driver,
+	FIELD_INIT(.kernel_driver_active, windows_kernel_driver_active),
+	FIELD_INIT(.detach_kernel_driver, windows_detach_kernel_driver),
+	FIELD_INIT(.attach_kernel_driver, windows_attach_kernel_driver),
 
-	.destroy_device = windows_destroy_device,
+	FIELD_INIT(.destroy_device, windows_destroy_device),
 
-	.submit_transfer = windows_submit_transfer,
-	.cancel_transfer = windows_cancel_transfer,
-	.clear_transfer_priv = windows_clear_transfer_priv,
+	FIELD_INIT(.submit_transfer, windows_submit_transfer),
+	FIELD_INIT(.cancel_transfer, windows_cancel_transfer),
+	FIELD_INIT(.clear_transfer_priv, windows_clear_transfer_priv),
 
-	.handle_events = windows_handle_events,
+	FIELD_INIT(.handle_events, windows_handle_events),
 
-	.clock_gettime = windows_clock_gettime,
+	FIELD_INIT(.clock_gettime, windows_clock_gettime),
 #if defined(USBI_TIMERFD_AVAILABLE)
-	.get_timerfd_clockid = NULL,
+	FIELD_INIT(.get_timerfd_clockid, NULL),
 #endif
-	.device_priv_size = sizeof(struct windows_device_priv),
-	.device_handle_priv_size = sizeof(struct windows_device_handle_priv),
-	.transfer_priv_size = sizeof(struct windows_transfer_priv),
-	.add_iso_packet_size = 0,
+	FIELD_INIT(.device_priv_size, sizeof(struct windows_device_priv)),
+	FIELD_INIT(.device_handle_priv_size, sizeof(struct windows_device_handle_priv)),
+	FIELD_INIT(.transfer_priv_size, sizeof(struct windows_transfer_priv)),
+	FIELD_INIT(.add_iso_packet_size, 0),
 };
 
 
@@ -2840,110 +2841,110 @@ const char* winusbx_driver_names[] = WINUSBX_DRV_NAMES;
 const char* hid_driver_names[] = {"HIDUSB", "MOUHID", "KBDHID"};
 const struct windows_usb_api_backend usb_api_backend[USB_API_MAX] = {
 	{
-		.id = USB_API_UNSUPPORTED,
-		.designation = "Unsupported API",
-		.driver_name_list = NULL,
-		.nb_driver_names = 0,
-		.init = unsupported_init,
-		.exit = unsupported_exit,
-		.open = unsupported_open,
-		.close = unsupported_close,
-		.configure_endpoints = unsupported_configure_endpoints,
-		.claim_interface = unsupported_claim_interface,
-		.set_interface_altsetting = unsupported_set_interface_altsetting,
-		.release_interface = unsupported_release_interface,
-		.clear_halt = unsupported_clear_halt,
-		.reset_device = unsupported_reset_device,
-		.submit_bulk_transfer = unsupported_submit_bulk_transfer,
-		.submit_iso_transfer = unsupported_submit_iso_transfer,
-		.submit_control_transfer = unsupported_submit_control_transfer,
-		.abort_control = unsupported_abort_control,
-		.abort_transfers = unsupported_abort_transfers,
-		.copy_transfer_data = unsupported_copy_transfer_data,
+		FIELD_INIT(.id, USB_API_UNSUPPORTED),
+		FIELD_INIT(.designation, "Unsupported API"),
+		FIELD_INIT(.driver_name_list, NULL),
+		FIELD_INIT(.nb_driver_names, 0),
+		FIELD_INIT(.init, unsupported_init),
+		FIELD_INIT(.exit, unsupported_exit),
+		FIELD_INIT(.open, unsupported_open),
+		FIELD_INIT(.close, unsupported_close),
+		FIELD_INIT(.configure_endpoints, unsupported_configure_endpoints),
+		FIELD_INIT(.claim_interface, unsupported_claim_interface),
+		FIELD_INIT(.set_interface_altsetting, unsupported_set_interface_altsetting),
+		FIELD_INIT(.release_interface, unsupported_release_interface),
+		FIELD_INIT(.clear_halt, unsupported_clear_halt),
+		FIELD_INIT(.reset_device, unsupported_reset_device),
+		FIELD_INIT(.submit_bulk_transfer, unsupported_submit_bulk_transfer),
+		FIELD_INIT(.submit_iso_transfer, unsupported_submit_iso_transfer),
+		FIELD_INIT(.submit_control_transfer, unsupported_submit_control_transfer),
+		FIELD_INIT(.abort_control, unsupported_abort_control),
+		FIELD_INIT(.abort_transfers, unsupported_abort_transfers),
+		FIELD_INIT(.copy_transfer_data, unsupported_copy_transfer_data),
 	}, {
-		.id = USB_API_HUB,
-		.designation = "HUB API",
-		.driver_name_list = hub_driver_names,
-		.nb_driver_names = ARRAYSIZE(hub_driver_names),
-		.init = unsupported_init,
-		.exit = unsupported_exit,
-		.open = unsupported_open,
-		.close = unsupported_close,
-		.configure_endpoints = unsupported_configure_endpoints,
-		.claim_interface = unsupported_claim_interface,
-		.set_interface_altsetting = unsupported_set_interface_altsetting,
-		.release_interface = unsupported_release_interface,
-		.clear_halt = unsupported_clear_halt,
-		.reset_device = unsupported_reset_device,
-		.submit_bulk_transfer = unsupported_submit_bulk_transfer,
-		.submit_iso_transfer = unsupported_submit_iso_transfer,
-		.submit_control_transfer = unsupported_submit_control_transfer,
-		.abort_control = unsupported_abort_control,
-		.abort_transfers = unsupported_abort_transfers,
-		.copy_transfer_data = unsupported_copy_transfer_data,
+		FIELD_INIT(.id, USB_API_HUB),
+		FIELD_INIT(.designation, "HUB API"),
+		FIELD_INIT(.driver_name_list, hub_driver_names),
+		FIELD_INIT(.nb_driver_names, ARRAYSIZE(hub_driver_names)),
+		FIELD_INIT(.init, unsupported_init),
+		FIELD_INIT(.exit, unsupported_exit),
+		FIELD_INIT(.open, unsupported_open),
+		FIELD_INIT(.close, unsupported_close),
+		FIELD_INIT(.configure_endpoints, unsupported_configure_endpoints),
+		FIELD_INIT(.claim_interface, unsupported_claim_interface),
+		FIELD_INIT(.set_interface_altsetting, unsupported_set_interface_altsetting),
+		FIELD_INIT(.release_interface, unsupported_release_interface),
+		FIELD_INIT(.clear_halt, unsupported_clear_halt),
+		FIELD_INIT(.reset_device, unsupported_reset_device),
+		FIELD_INIT(.submit_bulk_transfer, unsupported_submit_bulk_transfer),
+		FIELD_INIT(.submit_iso_transfer, unsupported_submit_iso_transfer),
+		FIELD_INIT(.submit_control_transfer, unsupported_submit_control_transfer),
+		FIELD_INIT(.abort_control, unsupported_abort_control),
+		FIELD_INIT(.abort_transfers, unsupported_abort_transfers),
+		FIELD_INIT(.copy_transfer_data, unsupported_copy_transfer_data),
 	}, {
-		.id = USB_API_COMPOSITE,
-		.designation = "Composite API",
-		.driver_name_list = composite_driver_names,
-		.nb_driver_names = ARRAYSIZE(composite_driver_names),
-		.init = composite_init,
-		.exit = composite_exit,
-		.open = composite_open,
-		.close = composite_close,
-		.configure_endpoints = common_configure_endpoints,
-		.claim_interface = composite_claim_interface,
-		.set_interface_altsetting = composite_set_interface_altsetting,
-		.release_interface = composite_release_interface,
-		.clear_halt = composite_clear_halt,
-		.reset_device =composite_reset_device,
-		.submit_bulk_transfer = composite_submit_bulk_transfer,
-		.submit_iso_transfer = composite_submit_iso_transfer,
-		.submit_control_transfer = composite_submit_control_transfer,
-		.abort_control = composite_abort_control,
-		.abort_transfers = composite_abort_transfers,
-		.copy_transfer_data = composite_copy_transfer_data,
+		FIELD_INIT(.id, USB_API_COMPOSITE),
+		FIELD_INIT(.designation, "Composite API"),
+		FIELD_INIT(.driver_name_list, composite_driver_names),
+		FIELD_INIT(.nb_driver_names, ARRAYSIZE(composite_driver_names)),
+		FIELD_INIT(.init, composite_init),
+		FIELD_INIT(.exit, composite_exit),
+		FIELD_INIT(.open, composite_open),
+		FIELD_INIT(.close, composite_close),
+		FIELD_INIT(.configure_endpoints, common_configure_endpoints),
+		FIELD_INIT(.claim_interface, composite_claim_interface),
+		FIELD_INIT(.set_interface_altsetting, composite_set_interface_altsetting),
+		FIELD_INIT(.release_interface, composite_release_interface),
+		FIELD_INIT(.clear_halt, composite_clear_halt),
+		FIELD_INIT(.reset_device, composite_reset_device),
+		FIELD_INIT(.submit_bulk_transfer, composite_submit_bulk_transfer),
+		FIELD_INIT(.submit_iso_transfer, composite_submit_iso_transfer),
+		FIELD_INIT(.submit_control_transfer, composite_submit_control_transfer),
+		FIELD_INIT(.abort_control, composite_abort_control),
+		FIELD_INIT(.abort_transfers, composite_abort_transfers),
+		FIELD_INIT(.copy_transfer_data, composite_copy_transfer_data),
 	}, {
-		.id = USB_API_WINUSBX,
-		.designation = "WinUSB-like APIs",
-		.driver_name_list = winusbx_driver_names,
-		.nb_driver_names = ARRAYSIZE(winusbx_driver_names),
-		.init = winusbx_init,
-		.exit = winusbx_exit,
-		.open = winusbx_open,
-		.close = winusbx_close,
-		.configure_endpoints = winusbx_configure_endpoints,
-		.claim_interface = winusbx_claim_interface,
-		.set_interface_altsetting = winusbx_set_interface_altsetting,
-		.release_interface = winusbx_release_interface,
-		.clear_halt = winusbx_clear_halt,
-		.reset_device = winusbx_reset_device,
-		.submit_bulk_transfer = winusbx_submit_bulk_transfer,
-		.submit_iso_transfer = unsupported_submit_iso_transfer,
-		.submit_control_transfer = winusbx_submit_control_transfer,
-		.abort_control = winusbx_abort_control,
-		.abort_transfers = winusbx_abort_transfers,
-		.copy_transfer_data = winusbx_copy_transfer_data,
+		FIELD_INIT(.id, USB_API_WINUSBX),
+		FIELD_INIT(.designation, "WinUSB-like APIs"),
+		FIELD_INIT(.driver_name_list, winusbx_driver_names),
+		FIELD_INIT(.nb_driver_names, ARRAYSIZE(winusbx_driver_names)),
+		FIELD_INIT(.init, winusbx_init),
+		FIELD_INIT(.exit, winusbx_exit),
+		FIELD_INIT(.open, winusbx_open),
+		FIELD_INIT(.close, winusbx_close),
+		FIELD_INIT(.configure_endpoints, winusbx_configure_endpoints),
+		FIELD_INIT(.claim_interface, winusbx_claim_interface),
+		FIELD_INIT(.set_interface_altsetting, winusbx_set_interface_altsetting),
+		FIELD_INIT(.release_interface, winusbx_release_interface),
+		FIELD_INIT(.clear_halt, winusbx_clear_halt),
+		FIELD_INIT(.reset_device, winusbx_reset_device),
+		FIELD_INIT(.submit_bulk_transfer, winusbx_submit_bulk_transfer),
+		FIELD_INIT(.submit_iso_transfer, unsupported_submit_iso_transfer),
+		FIELD_INIT(.submit_control_transfer, winusbx_submit_control_transfer),
+		FIELD_INIT(.abort_control, winusbx_abort_control),
+		FIELD_INIT(.abort_transfers, winusbx_abort_transfers),
+		FIELD_INIT(.copy_transfer_data, winusbx_copy_transfer_data),
 	}, {
-		.id = USB_API_HID,
-		.designation = "HID API",
-		.driver_name_list = hid_driver_names,
-		.nb_driver_names = ARRAYSIZE(hid_driver_names),
-		.init = hid_init,
-		.exit = hid_exit,
-		.open = hid_open,
-		.close = hid_close,
-		.configure_endpoints = common_configure_endpoints,
-		.claim_interface = hid_claim_interface,
-		.set_interface_altsetting = hid_set_interface_altsetting,
-		.release_interface = hid_release_interface,
-		.clear_halt = hid_clear_halt,
-		.reset_device = hid_reset_device,
-		.submit_bulk_transfer = hid_submit_bulk_transfer,
-		.submit_iso_transfer = unsupported_submit_iso_transfer,
-		.submit_control_transfer = hid_submit_control_transfer,
-		.abort_control = hid_abort_transfers,
-		.abort_transfers = hid_abort_transfers,
-		.copy_transfer_data = hid_copy_transfer_data,
+		FIELD_INIT(.id, USB_API_HID),
+		FIELD_INIT(.designation, "HID API"),
+		FIELD_INIT(.driver_name_list, hid_driver_names),
+		FIELD_INIT(.nb_driver_names, ARRAYSIZE(hid_driver_names)),
+		FIELD_INIT(.init, hid_init),
+		FIELD_INIT(.exit, hid_exit),
+		FIELD_INIT(.open, hid_open),
+		FIELD_INIT(.close, hid_close),
+		FIELD_INIT(.configure_endpoints, common_configure_endpoints),
+		FIELD_INIT(.claim_interface, hid_claim_interface),
+		FIELD_INIT(.set_interface_altsetting, hid_set_interface_altsetting),
+		FIELD_INIT(.release_interface, hid_release_interface),
+		FIELD_INIT(.clear_halt, hid_clear_halt),
+		FIELD_INIT(.reset_device, hid_reset_device),
+		FIELD_INIT(.submit_bulk_transfer, hid_submit_bulk_transfer),
+		FIELD_INIT(.submit_iso_transfer, unsupported_submit_iso_transfer),
+		FIELD_INIT(.submit_control_transfer, hid_submit_control_transfer),
+		FIELD_INIT(.abort_control, hid_abort_transfers),
+		FIELD_INIT(.abort_transfers, hid_abort_transfers),
+		FIELD_INIT(.copy_transfer_data, hid_copy_transfer_data),
 	},
 };
 
