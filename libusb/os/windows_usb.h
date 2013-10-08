@@ -24,6 +24,9 @@
 
 #include "windows_common.h"
 
+#include "setupapi.h"
+#include "winnt.h"
+
 #if defined(_MSC_VER)
 // disable /W4 MSVC warnings that are benign
 #pragma warning(disable:4127) // conditional expression is constant
@@ -92,7 +95,7 @@ const GUID GUID_DEVINTERFACE_LIBUSB0_FILTER = { 0xF9F3FF14, 0xAE21, 0x48A0, {0x8
 #define USB_API_HID         4
 #define USB_API_MAX         5
 // The following is used to indicate if the HID or composite extra props have already been set.
-#define USB_API_SET         (1<<USB_API_MAX) 
+#define USB_API_SET         (1<<USB_API_MAX)
 
 // Sub-APIs for WinUSB-like driver APIs (WinUSB, libusbK, libusb-win32 through the libusbK DLL)
 // Must have the same values as the KUSB_DRVID enum from libusbk.h
@@ -208,7 +211,6 @@ struct windows_device_priv {
 	uint8_t depth;						// distance to HCD
 	uint8_t port;						// port number on the hub
 	uint8_t active_config;
-	struct libusb_device *parent_dev;	// access to parent is required for usermode ops
 	struct windows_usb_api_backend const *apib;
 	char *path;							// device interface path
 	int sub_api;						// for WinUSB-like APIs
@@ -227,6 +229,7 @@ struct windows_device_priv {
 };
 
 static inline struct windows_device_priv *_device_priv(struct libusb_device *dev) {
+	if (dev == NULL) return NULL;
 	return (struct windows_device_priv *)dev->os_priv;
 }
 
@@ -235,7 +238,6 @@ static inline void windows_device_priv_init(libusb_device* dev) {
 	int i;
 	p->depth = 0;
 	p->port = 0;
-	p->parent_dev = NULL;
 	p->path = NULL;
 	p->apib = &usb_api_backend[USB_API_UNSUPPORTED];
 	p->sub_api = SUB_API_NOTSET;
@@ -307,6 +309,8 @@ DLL_DECLARE_PREFIXED(WINAPI, HRESULT, p, CLSIDFromString, (LPCOLESTR, LPCLSID));
 
 /* SetupAPI dependencies */
 DLL_DECLARE_PREFIXED(WINAPI, HDEVINFO, p, SetupDiGetClassDevsA, (const GUID*, PCSTR, HWND, DWORD));
+DLL_DECLARE_PREFIXED(WINAPI, HDEVINFO, p, SetupDiGetClassDevsExA, (const GUID*, PCSTR, HWND, DWORD, HDEVINFO, PCSTR, PVOID));
+DLL_DECLARE_PREFIXED(WINAPI, BOOL, p, SetupDiGetDeviceInstanceIdA, (HDEVINFO, PSP_DEVINFO_DATA, PSTR, DWORD, PDWORD));
 DLL_DECLARE_PREFIXED(WINAPI, BOOL, p, SetupDiEnumDeviceInfo, (HDEVINFO, DWORD, PSP_DEVINFO_DATA));
 DLL_DECLARE_PREFIXED(WINAPI, BOOL, p, SetupDiEnumDeviceInterfaces, (HDEVINFO, PSP_DEVINFO_DATA,
 			const GUID*, DWORD, PSP_DEVICE_INTERFACE_DATA));
@@ -778,7 +782,7 @@ typedef enum _KUSB_FNID
 	KUSB_FNID_GetOverlappedResult,
 	KUSB_FNID_GetProperty,
 	KUSB_FNID_COUNT,
-} KUSB_FNID; 
+} KUSB_FNID;
 
 typedef struct _KLIB_VERSION {
 	INT Major;
