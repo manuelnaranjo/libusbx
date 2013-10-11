@@ -146,6 +146,8 @@ windows)
 	LIBS=""
 	LTLDFLAGS="${LTLDFLAGS} -avoid-version -Wl,--add-stdcall-alias"
 	AC_DEFINE([POLL_NFDS_TYPE],[unsigned int],[type of second poll() argument])
+        AC_DEFINE(_WIN32_WINNT, 0x0502, [Windows Server 2003 with SP1, Windows XP with SP2 Required])
+        AC_DEFINE(WINVER, 0x0502, [Windows Server 2003 with SP1, Windows XP with SP2 Required])
 	;;
 esac
 
